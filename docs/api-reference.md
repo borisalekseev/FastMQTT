@@ -45,6 +45,10 @@
         - properties
         - ack
 
+::: zmqtt.ConnectionInfo
+    options:
+      show_source: false
+
 ## Configuration
 
 ::: zmqtt.client.ReconnectConfig
@@ -74,6 +78,10 @@
 ## Properties (MQTT 5.0)
 
 ::: zmqtt.PublishProperties
+    options:
+      show_source: false
+
+::: zmqtt.ConnAckProperties
     options:
       show_source: false
 
