@@ -162,8 +162,8 @@ jobs:
           $security = Join-Path $env:TEMP "dynamic-security.json"
           & $ctrl dynsec init $security admin admin
           $config = @(
-            "plugin $([char]34)$mosquittoDir/mosquitto_dynamic_security.dll$([char]34)"
-            "plugin_opt_config_file $([char]34)$security$([char]34)"
+            "global_plugin $mosquittoDir\mosquitto_dynamic_security.dll"
+            "plugin_opt_config_file $security"
             "listener 1884"
             "allow_anonymous true"
           )
