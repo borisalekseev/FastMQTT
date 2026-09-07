@@ -165,9 +165,9 @@ jobs:
             "listener 1884"
             "allow_anonymous true"
             "plugin $([char]34)$mosquittoDir/mosquitto_dynamic_security.dll$([char]34)"
-            "plugin_opt_config_file $security"
+            "plugin_opt_config_file $([char]34)$security$([char]34)"
           )
-          Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config
+          Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
           $stdout = "$env:TEMP/mosquitto.stdout.log"
           $stderr = "$env:TEMP/mosquitto.stderr.log"
           $broker = Start-Process -FilePath "$mosquittoDir/mosquitto.exe" `
