@@ -184,6 +184,12 @@ jobs:
           function DynSec { & $ctrl -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
           DynSec setDefaultACLAccess publishClientSend allow
           DynSec setDefaultACLAccess subscribe allow
+          DynSec createGroup zmqtt-anonymous-clients
+          DynSec createRole zmqtt-anonymous-role
+          DynSec addGroupRole zmqtt-anonymous-clients zmqtt-anonymous-role 10
+          DynSec addRoleACL zmqtt-anonymous-role subscribePattern '#' allow 10
+          DynSec addRoleACL zmqtt-anonymous-role publishClientSend '#' allow 10
+          DynSec setAnonymousGroup zmqtt-anonymous-clients
           DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
           DynSec createRole zmqtt-tests
           DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
