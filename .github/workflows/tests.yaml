@@ -123,6 +123,8 @@ jobs:
           dynsec() {
             "$MQTT_PREFIX/bin/mosquitto_ctrl" -h 127.0.0.1 -p 1884 -u admin -P admin dynsec "$@"
           }
+          dynsec setDefaultACLAccess publishClientSend allow
+          dynsec setDefaultACLAccess subscribe allow
           dynsec createClient zmqtt-mosquitto -p zmqtt-mosquitto
           dynsec createRole zmqtt-tests
           dynsec addClientRole zmqtt-mosquitto zmqtt-tests 10
@@ -166,9 +168,22 @@ jobs:
             "plugin_opt_config_file $security"
           )
           Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config
-          Start-Process -FilePath "$mosquittoDir/mosquitto.exe" -ArgumentList "-c $env:TEMP/mosquitto.conf" -WindowStyle Hidden
+          $stdout = "$env:TEMP/mosquitto.stdout.log"
+          $stderr = "$env:TEMP/mosquitto.stderr.log"
+          $broker = Start-Process -FilePath "$mosquittoDir/mosquitto.exe" `
+            -ArgumentList "-c $env:TEMP/mosquitto.conf" `
+            -WorkingDirectory $mosquittoDir `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -WindowStyle Hidden -PassThru
           Start-Sleep -Seconds 3
+          if ($broker.HasExited) {
+            Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
+            throw "Mosquitto exited with code $($broker.ExitCode)"
+          }
           function DynSec { & $ctrl -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
+          DynSec setDefaultACLAccess publishClientSend allow
+          DynSec setDefaultACLAccess subscribe allow
           DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
           DynSec createRole zmqtt-tests
           DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
