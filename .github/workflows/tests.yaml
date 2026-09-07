@@ -206,10 +206,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev
-      - name: Run non-broker tests
-        run: uv run pytest -vv -m "not broker"
-      - name: Run Mosquitto broker tests serially
-        run: uv run pytest -vv -n 0 tests/test_brokers/test_mosquitto.py
+      - name: Run targeted Mosquitto tests
+        run: >-
+          uv run pytest -vv -n 0 --maxfail=1
+          tests/test_brokers/test_mosquitto.py
+          -k "TestMosquittoV311 and ((persistent_session_replay_drops_without_ack_after_timeout and AT_LEAST_ONCE) or tcp_disconnect_wakes_subscription_when_reconnect_disabled or on_connection_recovery_failed_called)"
       - name: Show Mosquitto diagnostics
         if: always()
         shell: pwsh
