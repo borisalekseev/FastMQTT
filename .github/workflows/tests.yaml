@@ -110,7 +110,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install and start mosquitto
+      - name: Install Mosquitto
         run: |
           brew install mosquitto
           MQTT_PREFIX="$(brew --prefix)"
@@ -171,89 +171,73 @@ jobs:
           Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
           $stdout = "$env:TEMP/mosquitto.stdout.log"
           $stderr = "$env:TEMP/mosquitto.stderr.log"
-          $exitCode = "$env:TEMP/mosquitto.exit-code"
-          $watcherPath = "$env:TEMP/watch-mosquitto.ps1"
-          @'
-          param([int]$ProcessId, [string]$ExitCodePath)
-          $process = Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
-          if ($null -ne $process) {
-            $process.Refresh()
-            Set-Content -Path $ExitCodePath -Value "$($process.ExitCode)" -Encoding utf8NoBOM
-          }
-          '@ | Set-Content -Path $watcherPath -Encoding utf8NoBOM
-          $broker = Start-Process -FilePath "$mosquittoDir/mosquitto.exe" `
-            -ArgumentList "-c $env:TEMP/mosquitto.conf" `
-            -WorkingDirectory $mosquittoDir `
-            -RedirectStandardOutput $stdout `
-            -RedirectStandardError $stderr `
-            -WindowStyle Hidden -PassThru
-          Start-Sleep -Seconds 3
-          if ($broker.HasExited) {
-            Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
-            throw "Mosquitto exited with code $($broker.ExitCode)"
-          }
-          "MOSQUITTO_PID=$($broker.Id)" >> $env:GITHUB_ENV
+          "MOSQUITTO_DIR=$mosquittoDir" >> $env:GITHUB_ENV
+          "MOSQUITTO_CTRL=$ctrl" >> $env:GITHUB_ENV
+          "MOSQUITTO_CONFIG=$env:TEMP/mosquitto.conf" >> $env:GITHUB_ENV
+          "MOSQUITTO_SECURITY=$security" >> $env:GITHUB_ENV
           "MOSQUITTO_STDOUT=$stdout" >> $env:GITHUB_ENV
           "MOSQUITTO_STDERR=$stderr" >> $env:GITHUB_ENV
-          "MOSQUITTO_EXIT_CODE=$exitCode" >> $env:GITHUB_ENV
-          Start-Process pwsh -WindowStyle Hidden -ArgumentList @(
-            "-NoProfile", "-File", $watcherPath,
-            "-ProcessId", $broker.Id,
-            "-ExitCodePath", $exitCode
-          )
-          function DynSec { & $ctrl -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
-          DynSec setDefaultACLAccess publishClientSend allow
-          DynSec setDefaultACLAccess subscribe allow
-          DynSec createGroup zmqtt-anonymous-clients
-          DynSec createRole zmqtt-anonymous-role
-          DynSec addGroupRole zmqtt-anonymous-clients zmqtt-anonymous-role 10
-          DynSec addRoleACL zmqtt-anonymous-role subscribePattern '#' allow 10
-          DynSec addRoleACL zmqtt-anonymous-role publishClientSend '#' allow 10
-          DynSec setAnonymousGroup zmqtt-anonymous-clients
-          DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
-          DynSec createRole zmqtt-tests
-          DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
-          DynSec addRoleACL zmqtt-tests subscribePattern '#' allow 10
-          DynSec addRoleACL zmqtt-tests publishClientSend '#' allow 10
-          DynSec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
-          DynSec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
-          DynSec addRoleACL zmqtt-tests unsubscribePattern zmqtt/unsuback/denied/# deny 20
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev
-      - name: Run targeted Mosquitto tests
-        run: >-
-          uv run pytest -vv -n 0 --maxfail=1
-          tests/test_brokers/test_mosquitto.py
-          -k "TestMosquittoV311 and ((persistent_session_replay_drops_without_ack_after_timeout and AT_LEAST_ONCE) or tcp_disconnect_wakes_subscription_when_reconnect_disabled or on_connection_recovery_failed_called)"
-      - name: Show Mosquitto diagnostics
-        if: always()
+      - name: Run Mosquitto and targeted tests
         shell: pwsh
         run: |
-          $process = Get-Process -Id $env:MOSQUITTO_PID -ErrorAction SilentlyContinue
-          if ($null -eq $process) {
-            Write-Host "Mosquitto process $env:MOSQUITTO_PID is no longer running."
-          } else {
-            Write-Host "Mosquitto process $env:MOSQUITTO_PID is still running."
-          }
-          foreach ($path in @($env:MOSQUITTO_STDOUT, $env:MOSQUITTO_STDERR)) {
-            if (Test-Path $path) {
-              Write-Host "===== $path ====="
-              Get-Content $path -Tail 2000
+          $broker = Start-Process -FilePath "$env:MOSQUITTO_DIR/mosquitto.exe" `
+            -ArgumentList "-c $env:MOSQUITTO_CONFIG" `
+            -WorkingDirectory $env:MOSQUITTO_DIR `
+            -RedirectStandardOutput $env:MOSQUITTO_STDOUT `
+            -RedirectStandardError $env:MOSQUITTO_STDERR `
+            -WindowStyle Hidden -PassThru
+          $testExitCode = 1
+          try {
+            Start-Sleep -Seconds 3
+            if ($broker.HasExited) {
+              throw "Mosquitto exited with code $($broker.ExitCode)"
+            }
+            function DynSec { & $env:MOSQUITTO_CTRL -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
+            DynSec setDefaultACLAccess publishClientSend allow
+            DynSec setDefaultACLAccess subscribe allow
+            DynSec createGroup zmqtt-anonymous-clients
+            DynSec createRole zmqtt-anonymous-role
+            DynSec addGroupRole zmqtt-anonymous-clients zmqtt-anonymous-role 10
+            DynSec addRoleACL zmqtt-anonymous-role subscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-anonymous-role publishClientSend '#' allow 10
+            DynSec setAnonymousGroup zmqtt-anonymous-clients
+            DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
+            DynSec createRole zmqtt-tests
+            DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
+            DynSec addRoleACL zmqtt-tests subscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-tests publishClientSend '#' allow 10
+            DynSec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
+            DynSec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-tests unsubscribePattern zmqtt/unsuback/denied/# deny 20
+            & uv run pytest -vv -n 0 --maxfail=1 tests/test_brokers/test_mosquitto.py -k "TestMosquittoV311 and ((persistent_session_replay_drops_without_ack_after_timeout and AT_LEAST_ONCE) or tcp_disconnect_wakes_subscription_when_reconnect_disabled or on_connection_recovery_failed_called)"
+            $testExitCode = $LASTEXITCODE
+          } finally {
+            $broker.Refresh()
+            Write-Host "Mosquitto running: $(-not $broker.HasExited)"
+            if ($broker.HasExited) {
+              Write-Host "Mosquitto exit code: $($broker.ExitCode)"
+            }
+            foreach ($path in @($env:MOSQUITTO_STDOUT, $env:MOSQUITTO_STDERR)) {
+              if (Test-Path $path) {
+                Write-Host "===== $path ====="
+                Get-Content $path -Tail 2000
+              }
+            }
+            Get-WinEvent -FilterHashtable @{LogName = "Application"; StartTime = (Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match "mosquitto|Application Error" } |
+              Select-Object TimeCreated, ProviderName, Id, Message |
+              Format-List
+            if (-not $broker.HasExited) {
+              Stop-Process -Id $broker.Id -Force
             }
           }
-          if (Test-Path $env:MOSQUITTO_EXIT_CODE) {
-            Write-Host "Mosquitto exit code: $(Get-Content $env:MOSQUITTO_EXIT_CODE -Raw)"
-          }
-          Get-WinEvent -FilterHashtable @{LogName = "Application"; StartTime = (Get-Date).AddMinutes(-15)} `
-            -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -match "mosquitto|Application Error" } |
-            Select-Object TimeCreated, ProviderName, Id, Message |
-            Format-List
-          if ($null -eq $process) {
-            throw "Mosquitto exited during the test run."
+          if ($testExitCode -ne 0) {
+            exit $testExitCode
           }
 
   coverage:
