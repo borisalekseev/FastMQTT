@@ -8,9 +8,10 @@ import os
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Final, Literal, Protocol, overload
 
-from zmqtt._internal._compat import Self, defer_cancellation
+from zmqtt._internal._compat import ExceptionGroup, Self, defer_cancellation
 from zmqtt._internal.packets.auth import Auth
 from zmqtt._internal.packets.connect import Connect, Will
 from zmqtt._internal.packets.properties import (
@@ -31,7 +32,7 @@ from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
 from zmqtt._internal.types.retain_handling import RetainHandling
 from zmqtt._internal.types.topic import validate_publish, validate_response_topic, validate_subscribe_topic
-from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError
+from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError, MQTTUnsubscribeError
 
 __all__ = (
     "MQTTClient",
@@ -204,13 +205,72 @@ class Subscription:
         await self._do_subscribe(self._client._protocol)
         return self
 
-    async def __aexit__(self, *exc: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        body_error: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
         """Unsubscribe from all filters and stop message delivery."""
-        self._client._subscriptions.remove(self)
-        being_cancelled = isinstance(exc[1], asyncio.CancelledError)
-        if not being_cancelled and self._registered_filters and self._client._protocol is not None:
-            with contextlib.suppress(Exception):
-                await self._client._protocol.unsubscribe(self._registered_filters)
+        try:
+            await self._unsubscribe_for_exit(cancelled=isinstance(body_error, asyncio.CancelledError))
+        except MQTTUnsubscribeError as cleanup_error:
+            self._handle_unsubscribe_rejection(body_error, cleanup_error)
+        except MQTTDisconnectedError:
+            self._detach()
+        except Exception:
+            if body_error is None:
+                raise
+            log.warning("Subscription cleanup failed", exc_info=True)
+            self._detach()
+        return None
+
+    async def _unsubscribe_for_exit(self, *, cancelled: bool) -> None:
+        """Send UNSUBSCRIBE, allowing it to finish when cancellation is pending."""
+        if not cancelled:
+            await self._stop()
+            return
+        async with defer_cancellation():
+            await self._stop()
+
+    def _handle_unsubscribe_rejection(
+        self,
+        body_error: BaseException | None,
+        cleanup_error: MQTTUnsubscribeError,
+    ) -> None:
+        """Raise, combine, or log a rejected UNSUBACK without hiding the body error."""
+        if body_error is None:
+            raise cleanup_error
+        if isinstance(body_error, asyncio.CancelledError):
+            log.warning("Subscription cleanup failed during cancellation", exc_info=cleanup_error)
+            return
+        if isinstance(body_error, Exception):
+            message = "subscription cleanup failed"
+            raise ExceptionGroup(message, [body_error, cleanup_error]) from None
+
+        log.warning("Subscription cleanup failed", exc_info=cleanup_error)
+
+    async def _stop(self) -> None:
+        if not self._registered_filters:
+            self._detach()
+            return
+        protocol = self._client._protocol
+        if protocol is None:
+            msg = "Not connected"
+            raise MQTTDisconnectedError(msg)
+
+        try:
+            await protocol.unsubscribe(self._registered_filters)
+        except MQTTUnsubscribeError as error:
+            self._registered_filters = [filter_ for filter_ in self._registered_filters if filter_ in error.failures]
+            raise
+
+        self._registered_filters = []
+        self._detach()
+
+    def _detach(self) -> None:
+        if self in self._client._subscriptions:
+            self._client._subscriptions.remove(self)
 
     async def _do_subscribe(self, protocol: MQTTProtocol) -> None:
         reqs = [
@@ -256,15 +316,14 @@ class Subscription:
     async def stop(self) -> None:
         """Unsubscribe from all filters and stop message delivery.
 
-        Equivalent to exiting the async context manager. Sends UNSUBSCRIBE to
-        the broker. Safe to call even if the connection has already been lost —
-        the UNSUBSCRIBE is silently skipped in that case.
+        Sends UNSUBSCRIBE to the broker and propagates cleanup failures to the
+        caller.
 
         Example::
 
             await sub.stop()
         """
-        await self.__aexit__(None, None, None)
+        await self._stop()
 
     async def get_message(self) -> Message:
         """Wait for and return the next message from the subscription queue.

@@ -6,11 +6,13 @@ import sys
 from collections.abc import AsyncGenerator
 
 if sys.version_info >= (3, 11):
+    from builtins import ExceptionGroup
     from typing import Self
 else:
+    from exceptiongroup import ExceptionGroup
     from typing_extensions import Self
 
-__all__ = ("Self", "defer_cancellation")
+__all__ = ("ExceptionGroup", "Self", "defer_cancellation")
 
 if sys.version_info >= (3, 11):
 

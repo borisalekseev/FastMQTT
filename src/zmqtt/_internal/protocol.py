@@ -42,6 +42,7 @@ from zmqtt.errors import (
     MQTTPublishError,
     MQTTSubscribeError,
     MQTTTimeoutError,
+    MQTTUnsubscribeError,
 )
 
 log = logging.getLogger("zmqtt.protocol")
@@ -58,6 +59,8 @@ _PUBLISH_REASON_NAMES: Final[dict[int, str]] = {
     0x97: "Quota exceeded",
     0x99: "Payload format invalid",
 }
+
+_UNSUBACK_SUCCESS_CODES: Final[frozenset[int]] = frozenset({0x00, 0x11})
 
 
 class _SubscriptionGuard:
@@ -107,6 +110,33 @@ def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAc
     failures = {req.topic_filter: code for req, code in zip(filters, suback.return_codes, strict=False) if code >= 0x80}
     if failures:
         raise MQTTSubscribeError(failures)
+
+
+def _validate_unsuback(
+    filters: list[str],
+    unsuback: UnsubAck,
+    version: Literal["3.1.1", "5.0"],
+) -> None:
+    if version == "3.1.1":
+        return
+
+    if len(unsuback.reason_codes) != len(filters):
+        msg = (
+            "UNSUBACK reason-code count does not match unsubscribe request "
+            f"({len(unsuback.reason_codes)} != {len(filters)})"
+        )
+        raise MQTTProtocolError(msg)
+
+
+def _unsubscribe_error(filters: list[str], unsuback: UnsubAck) -> MQTTUnsubscribeError | None:
+    if not any(reason_code >= 0x80 for reason_code in unsuback.reason_codes):
+        return None
+    properties = unsuback.properties
+    return MQTTUnsubscribeError(
+        tuple(filters),
+        unsuback.reason_codes,
+        properties.reason_string if properties is not None else None,
+    )
 
 
 def _publish_error(packet: PubAck | PubRec) -> MQTTPublishError:
@@ -383,13 +413,27 @@ class MQTTProtocol:
         self._ensure_alive()
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
         broker_filters = [f for f in filters if f not in observed_filters]
-        for f in filters:
-            self._state.subscriptions.remove(f)
 
         unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
+        unsubscribe_error = _unsubscribe_error(broker_filters, unsuback) if unsuback is not None else None
+
+        if unsubscribe_error is None:
+            successful_broker_filters = broker_filters
+        else:
+            successful_broker_filters = [
+                filter_
+                for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True)
+                if reason_code in _UNSUBACK_SUCCESS_CODES
+            ]
+
+        for filter_ in [*observed_filters, *successful_broker_filters]:
+            self._state.subscriptions.remove(filter_)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
             await self._send_subscribe(requests, subscription_identifier=None)
+
+        if unsubscribe_error is not None:
+            raise unsubscribe_error
         return unsuback
 
     async def add_response_observer(self, topic: str) -> None:
@@ -467,7 +511,9 @@ class MQTTProtocol:
                 ),
             )
             log.debug("Sent UNSUBSCRIBE with packet_id=%d", pid)
-            return await future
+            unsuback = await future
+            _validate_unsuback(filters, unsuback, self._version)
+            return unsuback
         finally:
             self._state.pending_unsubs.pop(pid, None)
             self._state.packet_ids.release(pid)

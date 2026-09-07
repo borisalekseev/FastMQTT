@@ -4,7 +4,7 @@ import uuid
 import pytest
 
 from tests.test_brokers._base import BrokerTestBase
-from zmqtt import MQTTClient, QoS, ReconnectConfig, Subscription, Will, WillProperties
+from zmqtt import MQTTClient, MQTTUnsubscribeError, QoS, ReconnectConfig, Subscription, Will, WillProperties
 
 
 class BaseTestArtemis(BrokerTestBase):
@@ -113,3 +113,32 @@ class TestArtemisV5(BaseTestArtemis):
     host = "127.0.0.1"
     port = 1883
     version = "5.0"
+
+    @pytest.mark.xfail(reason="Confirmed Artemis bug")
+    async def test_mixed_unsubscribe_reports_only_rejected_filter(self, mqtt_client: MQTTClient) -> None:
+        suffix = uuid.uuid4().hex
+        allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
+        denied_filter = f"zmqtt/unsuback/denied/{suffix}"
+
+        sub = mqtt_client.subscribe(allowed_filter, denied_filter)
+        await sub.start()
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
+            await sub.stop()
+        with pytest.raises(MQTTUnsubscribeError) as retry_exc_info:
+            await sub.stop()
+        await mqtt_client.publish(allowed_filter, b"must-not-arrive", qos=QoS.AT_LEAST_ONCE)
+        await mqtt_client.publish(denied_filter, b"still-subscribed", qos=QoS.AT_LEAST_ONCE)
+        message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
+        error = exc_info.value
+        retry_error = retry_exc_info.value
+        assert error.failures == {denied_filter: 0x80}
+        assert error.topic_filters == (allowed_filter, denied_filter)
+        assert error.reason_codes == (0x00, 0x80)
+        assert retry_error.failures == {denied_filter: 0x80}
+        assert retry_error.topic_filters == (denied_filter,)
+        assert retry_error.reason_codes == (0x80,)
+        assert message.topic == denied_filter
+        assert message.payload == b"still-subscribed"
+        with pytest.raises(asyncio.TimeoutError):  # trying to get msg from unsubscribed filter
+            await asyncio.wait_for(sub.get_message(), timeout=0.5)

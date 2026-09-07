@@ -3,6 +3,11 @@ services:
     image: apache/activemq-artemis:latest-alpine
     environment:
       ANONYMOUS_LOGIN: "true"
+    volumes:
+      - ./docker/configure-artemis-unsuback-tests.sh:/configure-artemis-unsuback-tests.sh:ro
+    post_start:
+      - command: /bin/sh /configure-artemis-unsuback-tests.sh
+        user: root
     ports:
       - "1883:1883"
     security_opt:
@@ -10,11 +15,23 @@ services:
 
   mosquitto:
     image: eclipse-mosquitto:2
+    command: /bin/sh /mosquitto/config/start-mosquitto-dynsec.sh
     volumes:
-      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - ./docker/mosquitto.acl:/mosquitto/config/mosquitto.acl:ro
+      - ./docker/mosquitto-dynsec.conf:/mosquitto/config/mosquitto-dynsec.conf:ro
+      - ./docker/start-mosquitto-dynsec.sh:/mosquitto/config/start-mosquitto-dynsec.sh:ro
+    tmpfs:
+      - /mosquitto/data
     ports:
       - "1884:1883"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mosquitto_ctrl -h 127.0.0.1 -p 1883 -u admin -P admin dynsec getClient zmqtt-mosquitto >/dev/null 2>&1",
+        ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
     security_opt:
       - no-new-privileges:true
 

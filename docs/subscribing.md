@@ -24,7 +24,11 @@ async for msg in sub:
 await sub.stop()
 ```
 
-`stop()` sends UNSUBSCRIBE and releases internal resources. It is safe to call even if the connection has already been lost.
+`stop()` sends UNSUBSCRIBE and releases internal resources. It is safe to call even if the connection has already been lost. On MQTT 5, a rejected UNSUBACK raises `MQTTUnsubscribeError`; successful filters are removed locally, while rejected filters remain active and can be retried.
+
+The broker's `0x00` (`Success`) and `0x11` (`No subscription existed`)
+reason codes both count as successful. See [Error handling](error-handling.md)
+for the per-filter reason codes preserved by `MQTTUnsubscribeError`.
 
 ### Buffering and backpressure
 

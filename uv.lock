@@ -2224,6 +2224,7 @@ name = "zmqtt"
 version = "0.2.1"
 source = { editable = "." }
 dependencies = [
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 
@@ -2249,7 +2250,10 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.4" }]
+requires-dist = [
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'", specifier = ">=1.2" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'", specifier = ">=4.4" },
+]
 
 [package.metadata.requires-dev]
 dev = [

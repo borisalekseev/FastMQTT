@@ -9,6 +9,7 @@ MQTTError
   ├── MQTTDisconnectedError # connection lost unexpectedly
   ├── MQTTTimeoutError      # PINGRESP or CONNACK timed out
   ├── MQTTSubscribeError    # one or more filters rejected by the broker
+  ├── MQTTUnsubscribeError  # one or more filters rejected by the broker
   ├── MQTTPublishError      # QoS 1/2 publish rejected by the broker
   └── MQTTInvalidTopicError # topic string failed MQTT validation
 ```
@@ -23,6 +24,7 @@ from zmqtt import (
     MQTTDisconnectedError,
     MQTTTimeoutError,
     MQTTSubscribeError,
+    MQTTUnsubscribeError,
     MQTTPublishError,
     MQTTInvalidTopicError,
 )
@@ -70,6 +72,38 @@ except MQTTSubscribeError as e:
 ```
 
 The same exception is raised by `await sub.start()` when using the manual subscription lifecycle.
+
+### `MQTTUnsubscribeError`
+
+Raised by `await sub.stop()` when an MQTT 5 broker rejects one or more topic
+filters in its UNSUBACK response. The exception preserves the acknowledgement
+in request order:
+
+- `topic_filters` contains all requested filters;
+- `reason_codes` contains the corresponding UNSUBACK reason codes;
+- `failures` maps only rejected filters to their reason codes;
+- `reason_string` contains the broker's optional diagnostic Reason String.
+
+`0x00` (`Success`) and `0x11` (`No subscription existed`) are successful
+outcomes. With a mixed response, successful filters are removed locally while
+rejected filters remain active and are reported in `failures`:
+
+```python
+from zmqtt import MQTTUnsubscribeError
+
+try:
+    await sub.stop()
+except MQTTUnsubscribeError as error:
+    for topic_filter, reason_code in error.failures.items():
+        print(f"{topic_filter!r} rejected: 0x{reason_code:02X}")
+    print(error.reason_string)
+```
+
+The exception is also raised when cleanup runs through `async with`. If the
+subscription body already raised an application exception, both the body
+exception and the unsubscribe error are preserved in an exception group.
+Cancellation remains a cancellation; a rejected UNSUBACK during cancellation
+is logged as cleanup diagnostics.
 
 ### `MQTTPublishError`
 

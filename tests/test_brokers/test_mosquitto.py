@@ -1,10 +1,13 @@
 import asyncio
 import re
+import uuid
+from collections.abc import AsyncGenerator
 
 import pytest
 
 from tests.test_brokers._base import BrokerTestBase
-from zmqtt import Subscription
+from zmqtt import MQTTUnsubscribeError, Subscription
+from zmqtt._internal._compat import ExceptionGroup
 from zmqtt._internal.types.qos import QoS
 from zmqtt.client import MQTTClient
 from zmqtt.errors import MQTTPublishError
@@ -12,6 +15,20 @@ from zmqtt.errors import MQTTPublishError
 
 class BaseTestMosquitto(BrokerTestBase):
     denied_topic = "zmqtt/e2e/denied"
+    username = "zmqtt-mosquitto"
+    password = "zmqtt-mosquitto"  # noqa: S105
+
+    @pytest.fixture
+    async def mqtt_client(self) -> AsyncGenerator[MQTTClient]:
+        async with MQTTClient(
+            self.host,
+            self.port,
+            client_id=f"zmqtt-test-{uuid.uuid4().hex[:8]}",
+            username=self.username,
+            password=self.password,
+            version=self.version,
+        ) as client:
+            yield client
 
     async def handle_sub_duplicates(
         self,
@@ -82,3 +99,59 @@ class TestMosquittoV5(BaseTestMosquitto):
 
         assert msg.topic == topic
         assert msg.payload == b"payload-qos0"
+
+    async def test_rejected_unsubscribe_raises_error(self, mqtt_client: MQTTClient) -> None:
+        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
+
+        sub = mqtt_client.subscribe(denied_filter)
+        await sub.start()
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
+            await sub.stop()
+
+        error = exc_info.value
+        assert error.failures == {denied_filter: 0x87}
+        assert error.topic_filters == (denied_filter,)
+        assert error.reason_codes == (0x87,)
+        assert error.reason_string is None
+
+    async def test_mixed_unsubscribe_reports_only_rejected_filter(self, mqtt_client: MQTTClient) -> None:
+        suffix = uuid.uuid4().hex
+        allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
+        denied_filter = f"zmqtt/unsuback/denied/{suffix}"
+
+        sub = mqtt_client.subscribe(allowed_filter, denied_filter)
+        await sub.start()
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
+            await sub.stop()
+        with pytest.raises(MQTTUnsubscribeError) as retry_exc_info:
+            await sub.stop()
+        await mqtt_client.publish(allowed_filter, b"must-not-arrive", qos=QoS.AT_LEAST_ONCE)
+        await mqtt_client.publish(denied_filter, b"still-subscribed", qos=QoS.AT_LEAST_ONCE)
+        message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
+        error = exc_info.value
+        retry_error = retry_exc_info.value
+        assert error.failures == {denied_filter: 0x87}
+        assert error.topic_filters == (allowed_filter, denied_filter)
+        assert error.reason_codes == (0x00, 0x87)
+        assert retry_error.failures == {denied_filter: 0x87}
+        assert retry_error.topic_filters == (denied_filter,)
+        assert retry_error.reason_codes == (0x87,)
+        assert message.topic == denied_filter
+        assert message.payload == b"still-subscribed"
+        with pytest.raises(asyncio.TimeoutError):  # trying to get msg from unsubscribed filter
+            await asyncio.wait_for(sub.get_message(), timeout=0.5)
+
+    async def test_rejected_subscription_cleanup_preserves_body_error(self, mqtt_client: MQTTClient) -> None:
+        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
+        body_error = RuntimeError("application failed")
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            async with mqtt_client.subscribe(denied_filter):
+                raise body_error
+
+        errors = exc_info.value.exceptions
+        assert errors[0] is body_error
+        cleanup_error = errors[1]
+        assert isinstance(cleanup_error, MQTTUnsubscribeError)
+        assert cleanup_error.failures == {denied_filter: 0x87}

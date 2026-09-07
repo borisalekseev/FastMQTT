@@ -9,7 +9,10 @@ authors = [
     { name = "borisalekseev", email = "i.borisalekseev@gmail.com" }
 ]
 requires-python = ">=3.10"
-dependencies = ["typing_extensions>=4.4; python_version < '3.11'"]
+dependencies = [
+    "exceptiongroup>=1.2; python_version < '3.11'",
+    "typing_extensions>=4.4; python_version < '3.11'",
+]
 keywords = ["mqtt", "mqtt5", "iot", "python-mqtt", "zmqtt"]
 classifiers = [
     "Development Status :: 3 - Alpha",
