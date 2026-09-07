@@ -157,15 +157,15 @@ jobs:
         shell: pwsh
         run: |
           winget install -e --id EclipseFoundation.Mosquitto --accept-source-agreements --accept-package-agreements --silent
-          $mosquittoDir = "C:/Program Files/mosquitto"
+          $mosquittoDir = "C:\Program Files\mosquitto"
           $ctrl = "$mosquittoDir/mosquitto_ctrl.exe"
-          $security = "$env:TEMP/dynamic-security.json"
+          $security = Join-Path $env:TEMP "dynamic-security.json"
           & $ctrl dynsec init $security admin admin
           $config = @(
-            "listener 1884"
-            "allow_anonymous true"
             "plugin $([char]34)$mosquittoDir/mosquitto_dynamic_security.dll$([char]34)"
             "plugin_opt_config_file $([char]34)$security$([char]34)"
+            "listener 1884"
+            "allow_anonymous true"
           )
           Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
           $stdout = "$env:TEMP/mosquitto.stdout.log"
