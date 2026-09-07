@@ -181,6 +181,9 @@ jobs:
             Get-Content $stdout, $stderr -ErrorAction SilentlyContinue
             throw "Mosquitto exited with code $($broker.ExitCode)"
           }
+          "MOSQUITTO_PID=$($broker.Id)" >> $env:GITHUB_ENV
+          "MOSQUITTO_STDOUT=$stdout" >> $env:GITHUB_ENV
+          "MOSQUITTO_STDERR=$stderr" >> $env:GITHUB_ENV
           function DynSec { & $ctrl -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
           DynSec setDefaultACLAccess publishClientSend allow
           DynSec setDefaultACLAccess subscribe allow
@@ -203,7 +206,29 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev
-      - run: uv run pytest -vv --ignore=tests/test_brokers/test_artemis.py --ignore=tests/test_brokers/test_hivemq.py --ignore=tests/test_brokers/test_nanomq.py --ignore=tests/test_brokers/test_emqx.py
+      - name: Run non-broker tests
+        run: uv run pytest -vv -m "not broker"
+      - name: Run Mosquitto broker tests serially
+        run: uv run pytest -vv -n 0 tests/test_brokers/test_mosquitto.py
+      - name: Show Mosquitto diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $process = Get-Process -Id $env:MOSQUITTO_PID -ErrorAction SilentlyContinue
+          if ($null -eq $process) {
+            Write-Host "Mosquitto process $env:MOSQUITTO_PID is no longer running."
+          } else {
+            Write-Host "Mosquitto process $env:MOSQUITTO_PID is still running."
+          }
+          foreach ($path in @($env:MOSQUITTO_STDOUT, $env:MOSQUITTO_STDERR)) {
+            if (Test-Path $path) {
+              Write-Host "===== $path ====="
+              Get-Content $path -Tail 2000
+            }
+          }
+          if ($null -eq $process) {
+            throw "Mosquitto exited during the test run."
+          }
 
   coverage:
     name: Publish coverage
