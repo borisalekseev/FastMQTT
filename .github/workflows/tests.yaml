@@ -162,7 +162,8 @@ jobs:
           $security = Join-Path $env:TEMP "dynamic-security.json"
           & $ctrl dynsec init $security admin admin
           $config = @(
-            "global_plugin $mosquittoDir\mosquitto_dynamic_security.dll"
+            "per_listener_settings false"
+            "plugin $mosquittoDir\mosquitto_dynamic_security.dll"
             "plugin_opt_config_file $security"
             "listener 1884"
             "allow_anonymous true"
@@ -170,6 +171,16 @@ jobs:
           Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
           $stdout = "$env:TEMP/mosquitto.stdout.log"
           $stderr = "$env:TEMP/mosquitto.stderr.log"
+          $exitCode = "$env:TEMP/mosquitto.exit-code"
+          $watcherPath = "$env:TEMP/watch-mosquitto.ps1"
+          @'
+          param([int]$ProcessId, [string]$ExitCodePath)
+          $process = Wait-Process -Id $ProcessId -ErrorAction SilentlyContinue
+          if ($null -ne $process) {
+            $process.Refresh()
+            Set-Content -Path $ExitCodePath -Value "$($process.ExitCode)" -Encoding utf8NoBOM
+          }
+          '@ | Set-Content -Path $watcherPath -Encoding utf8NoBOM
           $broker = Start-Process -FilePath "$mosquittoDir/mosquitto.exe" `
             -ArgumentList "-c $env:TEMP/mosquitto.conf" `
             -WorkingDirectory $mosquittoDir `
@@ -184,6 +195,12 @@ jobs:
           "MOSQUITTO_PID=$($broker.Id)" >> $env:GITHUB_ENV
           "MOSQUITTO_STDOUT=$stdout" >> $env:GITHUB_ENV
           "MOSQUITTO_STDERR=$stderr" >> $env:GITHUB_ENV
+          "MOSQUITTO_EXIT_CODE=$exitCode" >> $env:GITHUB_ENV
+          Start-Process pwsh -WindowStyle Hidden -ArgumentList @(
+            "-NoProfile", "-File", $watcherPath,
+            "-ProcessId", $broker.Id,
+            "-ExitCodePath", $exitCode
+          )
           function DynSec { & $ctrl -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
           DynSec setDefaultACLAccess publishClientSend allow
           DynSec setDefaultACLAccess subscribe allow
@@ -227,6 +244,14 @@ jobs:
               Get-Content $path -Tail 2000
             }
           }
+          if (Test-Path $env:MOSQUITTO_EXIT_CODE) {
+            Write-Host "Mosquitto exit code: $(Get-Content $env:MOSQUITTO_EXIT_CODE -Raw)"
+          }
+          Get-WinEvent -FilterHashtable @{LogName = "Application"; StartTime = (Get-Date).AddMinutes(-15)} `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match "mosquitto|Application Error" } |
+            Select-Object TimeCreated, ProviderName, Id, Message |
+            Format-List
           if ($null -eq $process) {
             throw "Mosquitto exited during the test run."
           }
