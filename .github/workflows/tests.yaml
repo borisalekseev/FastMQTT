@@ -153,7 +153,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install and start mosquitto
+      - name: Install Mosquitto
         shell: pwsh
         run: |
           winget install -e --id EclipseFoundation.Mosquitto --accept-source-agreements --accept-package-agreements --silent
@@ -169,14 +169,9 @@ jobs:
             "allow_anonymous true"
           )
           Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
-          $stdout = "$env:TEMP/mosquitto.stdout.log"
-          $stderr = "$env:TEMP/mosquitto.stderr.log"
           "MOSQUITTO_DIR=$mosquittoDir" >> $env:GITHUB_ENV
           "MOSQUITTO_CTRL=$ctrl" >> $env:GITHUB_ENV
           "MOSQUITTO_CONFIG=$env:TEMP/mosquitto.conf" >> $env:GITHUB_ENV
-          "MOSQUITTO_SECURITY=$security" >> $env:GITHUB_ENV
-          "MOSQUITTO_STDOUT=$stdout" >> $env:GITHUB_ENV
-          "MOSQUITTO_STDERR=$stderr" >> $env:GITHUB_ENV
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -188,8 +183,6 @@ jobs:
           $broker = Start-Process -FilePath "$env:MOSQUITTO_DIR/mosquitto.exe" `
             -ArgumentList "-c $env:MOSQUITTO_CONFIG" `
             -WorkingDirectory $env:MOSQUITTO_DIR `
-            -RedirectStandardOutput $env:MOSQUITTO_STDOUT `
-            -RedirectStandardError $env:MOSQUITTO_STDERR `
             -WindowStyle Hidden -PassThru
           $testExitCode = 1
           try {
@@ -214,24 +207,10 @@ jobs:
             DynSec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
             DynSec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
             DynSec addRoleACL zmqtt-tests unsubscribePattern zmqtt/unsuback/denied/# deny 20
-            & uv run pytest -vv -n 0 --maxfail=1 tests/test_brokers/test_mosquitto.py -k "TestMosquittoV311 and ((persistent_session_replay_drops_without_ack_after_timeout and AT_LEAST_ONCE) or tcp_disconnect_wakes_subscription_when_reconnect_disabled or on_connection_recovery_failed_called)"
+            & uv run pytest -vv --ignore=tests/test_brokers/test_artemis.py --ignore=tests/test_brokers/test_hivemq.py --ignore=tests/test_brokers/test_nanomq.py --ignore=tests/test_brokers/test_emqx.py
             $testExitCode = $LASTEXITCODE
           } finally {
             $broker.Refresh()
-            Write-Host "Mosquitto running: $(-not $broker.HasExited)"
-            if ($broker.HasExited) {
-              Write-Host "Mosquitto exit code: $($broker.ExitCode)"
-            }
-            foreach ($path in @($env:MOSQUITTO_STDOUT, $env:MOSQUITTO_STDERR)) {
-              if (Test-Path $path) {
-                Write-Host "===== $path ====="
-                Get-Content $path -Tail 2000
-              }
-            }
-            Get-WinEvent -FilterHashtable @{LogName = "Application"; StartTime = (Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue |
-              Where-Object { $_.Message -match "mosquitto|Application Error" } |
-              Select-Object TimeCreated, ProviderName, Id, Message |
-              Format-List
             if (-not $broker.HasExited) {
               Stop-Process -Id $broker.Id -Force
             }
