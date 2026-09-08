@@ -696,24 +696,22 @@ class BrokerTestBase(abc.ABC):
             _ = client.connection_info
         for connection_id in (1, 2):
             await client.connect()
-            try:
-                info = client.connection_info
-                assert info.connection_id == connection_id
-                assert info.return_code == 0
-                assert not info.session_present
-                assert info.effective_client_id == client_id
-                assert info.effective_keepalive == 60
-                assert info.effective_session_expiry_interval == (0 if self.version == "5.0" else None)
-                if self.version == "3.1.1":
-                    assert info.properties is None
-                with pytest.raises(FrozenInstanceError):
-                    info.connection_id = 100  # type: ignore[misc]
-                with pytest.raises(AttributeError):
-                    client.connection_info = info  # type: ignore[misc]
-                rtt = await client.ping()
-                assert rtt >= 0
-            finally:
-                await client.disconnect()
+            info = client.connection_info
+            assert info.connection_id == connection_id
+            assert info.return_code == 0
+            assert not info.session_present
+            assert info.effective_client_id == client_id
+            assert info.effective_keepalive == 60
+            assert info.effective_session_expiry_interval == (0 if self.version == "5.0" else None)
+            if self.version == "3.1.1":
+                assert info.properties is None
+            with pytest.raises(FrozenInstanceError):
+                info.connection_id = 100  # type: ignore[misc]
+            with pytest.raises(AttributeError):
+                client.connection_info = info  # type: ignore[misc]
+            rtt = await client.ping()
+            assert rtt >= 0
+            await client.disconnect()
             with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
                 _ = client.connection_info
             assert info.connection_id == connection_id
