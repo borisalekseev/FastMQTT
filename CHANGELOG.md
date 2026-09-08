@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v0.2.2 (2026-09-08)
+
+### Bug Fixes
+
+- "Tests" badge ([#71](https://github.com/faststream-community/zMQTT/pull/71),
+  [`dc9b459`](https://github.com/faststream-community/zMQTT/commit/dc9b459244478a36ec9fa14b06ce4607abc297eb))
+
+### Chores
+
+- Update README badges ([#69](https://github.com/faststream-community/zMQTT/pull/69),
+  [`2c1bf3c`](https://github.com/faststream-community/zMQTT/commit/2c1bf3c9e0b4b75949bcc8ece64eedbfd1fb082a))
+
+### Continuous Integration
+
+- **deps**: Bump the github-actions group with 2 updates
+  ([#94](https://github.com/faststream-community/zMQTT/pull/94),
+  [`9c4001a`](https://github.com/faststream-community/zMQTT/commit/9c4001acdd1571beac8ea97975151db258b8d302))
+
+- **deps**: Bump the github-actions group with 2 updates
+  ([#70](https://github.com/faststream-community/zMQTT/pull/70),
+  [`3341b00`](https://github.com/faststream-community/zMQTT/commit/3341b0033ce7671a0630b3e9078ec2b03a0a9fd3))
+
+### Features
+
+- **client**: Expose MQTT connection information
+  ([#92](https://github.com/faststream-community/zMQTT/pull/92),
+  [`a6daf60`](https://github.com/faststream-community/zMQTT/commit/a6daf60a1c5dab8cfb7cb6886199dfd6c1fbf978))
+
+
 ## v0.2.1 (2026-08-30)
 
 ### Bug Fixes
