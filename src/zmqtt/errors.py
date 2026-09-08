@@ -1,9 +1,4 @@
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from zmqtt._internal.packets.properties import ConnAckProperties
+from zmqtt._internal.packets.properties import ConnAckProperties
 
 
 class MQTTError(Exception):

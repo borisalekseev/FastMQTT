@@ -15,51 +15,37 @@ The return type is `MQTTClientV5`, which exposes 5.0-specific methods and accept
 
 ## Connection information
 
-`client.connection_info` is a read-only `ConnectionInfo | None` property on all
-client types, including MQTT 3.1.1. After a successful handshake it holds an
-immutable snapshot:
+`client.connection_info` returns an immutable `ConnectionInfo` snapshot of the
+current successful handshake on all client types, including MQTT 3.1.1:
 
 ```python
 async with create_client("localhost", version="5.0") as client:
     info = client.connection_info
-    if info is not None:
-        print(info.connection_id, info.session_present, info.return_code)
-        print(info.effective_client_id, info.effective_keepalive)
-        print(info.effective_session_expiry_interval)
-        if info.properties is not None:
-            print(info.properties.response_information)
-            for key, value in info.properties.user_properties:
-                print(key, value)
+    print(info.connection_id, info.session_present)
+    print(info.effective_client_id, info.effective_keepalive)
+    print(info.effective_session_expiry_interval)
+    if info.properties is not None:
+        print(info.properties.response_information)
+        print(info.properties.user_properties)
 ```
 
-`properties` contains the received `ConnAckProperties` without defaults, or
-`None` if none were received. Repeated User Properties keep their wire order.
-Both the snapshot and its nested properties are immutable.
+`properties` holds raw `ConnAckProperties` without defaults, or `None` when
+absent. Repeated User Properties retain their order. Effective values use the
+broker's Assigned Client Identifier when CONNECT sent an empty ID, Server Keep
+Alive over CONNECT's keepalive, and CONNACK session expiry over CONNECT's expiry
+(default `0`). Explicit zero values are preserved; MQTT 3.1.1 has no properties
+or session expiry. See the [MQTT 5.0 specification, CONNACK properties](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901086).
 
-Effective Client ID is the ID sent in CONNECT, or Assigned Client Identifier
-when the sent ID was empty. It stays empty if the broker omits the assignment.
-Effective Keep Alive uses Server Keep Alive when present, otherwise CONNECT's
-value. Effective Session Expiry Interval uses CONNACK's value, then CONNECT's
-value, then `0`; an explicit broker value of `0` is preserved. MQTT 3.1.1 exposes
-`None` for properties and effective session expiry.
+Access raises `MQTTDisconnectedError` before connecting, during retries, and
+after disconnection or background-loop failure. Each successful handshake gets
+a new `connection_id`, starting at 1, even when the MQTT session resumes.
+Failed attempts do not increment it; saved snapshots remain unchanged.
+Subscription restoration may still be running when the snapshot becomes available.
 
-The property is `None` before connecting, after a detected disconnection, during
-retries, and after shutdown or background-loop failure. Each successful network
-connection increments `connection_id`, starting at 1, even if the MQTT session
-resumes. Failed attempts do not increment it. Saved snapshots remain unchanged.
-A snapshot means the handshake succeeded; subscription restoration may still
-be running.
-
-The effective values describe negotiation. Applying Server Keep Alive to ping
-scheduling is tracked in [#77](https://github.com/faststream-community/zMQTT/issues/77),
-and reusing the assigned ID on later CONNECT packets in
-[#79](https://github.com/faststream-community/zMQTT/issues/79).
-Broker limits exposed here are not automatically enforced.
-
-Response Information is available as the raw string
-`info.properties.response_information`; it does not change reply topics or
-`request()`. Requesting it through CONNECT requires the configuration API tracked
-in [#82](https://github.com/faststream-community/zMQTT/issues/82).
+Effective values describe negotiation; they do not change ping scheduling,
+future CONNECT IDs, or enforce broker limits. Response Information is the raw
+broker string and does not alter reply topics or `request()`. Requesting it in
+CONNECT is not currently exposed by the client configuration.
 
 ## Session expiry interval
 

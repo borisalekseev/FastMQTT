@@ -7,8 +7,10 @@ Run with:  pytest -m broker
 import abc
 import asyncio
 import contextlib
+import ssl
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import FrozenInstanceError
 from typing import ClassVar, Literal
 
 import pytest
@@ -24,7 +26,10 @@ from zmqtt import (
     Subscription,
     Will,
     WillProperties,
+    create_client,
 )
+from zmqtt._internal.transport.base import Transport
+from zmqtt._internal.transport.tcp import open_tcp
 
 
 @pytest.mark.broker
@@ -532,6 +537,8 @@ class BrokerTestBase(abc.ABC):
 
             with pytest.raises(MQTTDisconnectedError):
                 await asyncio.wait_for(message_task, timeout=5.0)
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
 
     async def test_on_connection_recovery_failed_called(self) -> None:
         callback_calls = 0
@@ -539,6 +546,8 @@ class BrokerTestBase(abc.ABC):
         async def on_connection_recovery_failed() -> None:
             nonlocal callback_calls
             callback_calls += 1
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
 
         client = MQTTClient(
             self.host,
@@ -676,18 +685,91 @@ class BrokerTestBase(abc.ABC):
         assert msg.payload == b"ack-twice"
 
     async def test_manual_connect_disconnect(self) -> None:
+        client_id = f"zmqtt-manual-{uuid.uuid4().hex[:8]}"
+        client = create_client(
+            self.host,
+            self.port,
+            client_id=client_id,
+            version=self.version,
+        )
+        with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+            _ = client.connection_info
+        for connection_id in (1, 2):
+            await client.connect()
+            try:
+                info = client.connection_info
+                assert info.connection_id == connection_id
+                assert info.return_code == 0
+                assert not info.session_present
+                assert info.effective_client_id == client_id
+                assert info.effective_keepalive == 60
+                assert info.effective_session_expiry_interval == (0 if self.version == "5.0" else None)
+                if self.version == "3.1.1":
+                    assert info.properties is None
+                with pytest.raises(FrozenInstanceError):
+                    info.connection_id = 100  # type: ignore[misc]
+                with pytest.raises(AttributeError):
+                    client.connection_info = info  # type: ignore[misc]
+                rtt = await client.ping()
+                assert rtt >= 0
+            finally:
+                await client.disconnect()
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            assert info.connection_id == connection_id
+
+    async def test_connection_info_reconnect_after_failed_attempt(self, topic: str) -> None:
+        attempts = 0
+        retry_entered = asyncio.Event()
+        allow_retry = asyncio.Event()
+        client_id = f"zmqtt-info-{uuid.uuid4().hex[:8]}"
+
+        async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+            nonlocal attempts
+            attempts += 1
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            if attempts == 2:
+                retry_entered.set()
+                await allow_retry.wait()
+                msg = "temporary connection failure"
+                raise OSError(msg)
+            return await open_tcp(host, port)
+
         client = MQTTClient(
             self.host,
             self.port,
-            client_id=f"zmqtt-manual-{uuid.uuid4().hex[:8]}",
             version=self.version,
+            client_id=client_id,
+            transport_factory=factory,
+            reconnect=ReconnectConfig(initial_delay=0, max_attempts=2),
         )
-        await client.connect()
-        try:
-            rtt = await client.ping()
-            assert rtt >= 0
-        finally:
-            await client.disconnect()
+        async with client, client.subscribe(topic) as subscription:
+            old = client.connection_info
+            await self.force_tcp_disconnect(client)
+            await asyncio.wait_for(retry_entered.wait(), timeout=5)
+            with pytest.raises(MQTTDisconnectedError, match="No active connection information"):
+                _ = client.connection_info
+            allow_retry.set()
+
+            # A delivered message proves both handshake and subscription recovery.
+            async with MQTTClient(self.host, self.port, version=self.version) as publisher:
+                for _ in range(50):
+                    await publisher.publish(topic, b"reconnected")
+                    try:
+                        message = await asyncio.wait_for(subscription.get_message(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        continue
+                    break
+                else:
+                    pytest.fail("Subscription did not recover within 5 s")
+            assert message.payload == b"reconnected"
+            new = client.connection_info
+            assert new.connection_id == 2
+            assert new is not old
+            assert old.connection_id == 1
+            assert new.effective_client_id == old.effective_client_id == client_id
+            assert attempts == 3
 
     async def test_context_manager_manual_pub_sub(self, topic: str) -> None:
         async with MQTTClient(

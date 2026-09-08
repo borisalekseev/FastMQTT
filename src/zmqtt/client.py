@@ -12,7 +12,7 @@ from typing import Final, Literal, Protocol, overload
 
 from zmqtt._internal._compat import Self, defer_cancellation
 from zmqtt._internal.packets.auth import Auth
-from zmqtt._internal.packets.connect import Connect, Will
+from zmqtt._internal.packets.connect import ConnAck, Connect, Will
 from zmqtt._internal.packets.properties import (
     AuthProperties,
     ConnAckProperties,
@@ -77,6 +77,41 @@ class ConnectionInfo:
     effective_keepalive: int
     effective_session_expiry_interval: int | None
 
+    @classmethod
+    def from_connack(
+        cls,
+        connect_packet: Connect,
+        connack: ConnAck,
+        *,
+        version: Literal["3.1.1", "5.0"],
+        connection_id: int,
+    ) -> Self:
+        """Build a snapshot from a successful CONNECT/CONNACK exchange."""
+        properties = connack.properties
+        client_id = connect_packet.client_id
+        keepalive = connect_packet.keepalive
+        expiry = None
+        if version == "5.0":
+            expiry = 0
+            if connect_packet.properties is not None and connect_packet.properties.session_expiry_interval is not None:
+                expiry = connect_packet.properties.session_expiry_interval
+        if properties is not None:
+            if not client_id and properties.assigned_client_identifier is not None:
+                client_id = properties.assigned_client_identifier
+            if properties.server_keep_alive is not None:
+                keepalive = properties.server_keep_alive
+            if version == "5.0" and properties.session_expiry_interval is not None:
+                expiry = properties.session_expiry_interval
+        return cls(
+            connection_id=connection_id,
+            session_present=connack.session_present,
+            return_code=connack.return_code,
+            properties=properties,
+            effective_client_id=client_id,
+            effective_keepalive=keepalive,
+            effective_session_expiry_interval=expiry,
+        )
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ReconnectConfig:
@@ -134,7 +169,7 @@ class MQTTClientV311(Protocol):
     ) -> "Subscription": ...
 
     @property
-    def connection_info(self) -> ConnectionInfo | None: ...
+    def connection_info(self) -> ConnectionInfo: ...
 
     async def connect(self) -> None: ...
 
@@ -150,7 +185,7 @@ class MQTTClientV5(Protocol):
     async def __aexit__(self, *exc: object) -> None: ...
 
     @property
-    def connection_info(self) -> ConnectionInfo | None: ...
+    def connection_info(self) -> ConnectionInfo: ...
 
     async def connect(self) -> None: ...
 
@@ -466,13 +501,20 @@ class MQTTClient:
         self._subscription_failure: asyncio.Future[BaseException] | None = None
 
     @property
-    def connection_info(self) -> ConnectionInfo | None:
-        """Current successful handshake, or None while disconnected/retrying.
+    def connection_info(self) -> ConnectionInfo:
+        """Current successful handshake.
 
         Subscription restoration may still be in progress. Previously returned
         snapshots remain valid after disconnection. Effective values describe
         negotiation; they do not change ping scheduling or future CONNECT IDs.
+
+        Raises:
+            MQTTDisconnectedError: If no successful connection is active,
+                including before connecting and during reconnection.
         """
+        if self._connection_info is None:
+            msg = "No active connection information"
+            raise MQTTDisconnectedError(msg)
         return self._connection_info
 
     async def __aenter__(self) -> Self:
@@ -806,29 +848,11 @@ class MQTTClient:
         except BaseException:
             await transport.close()
             raise
-        properties = connack.properties
-        client_id = connect_packet.client_id
-        keepalive = connect_packet.keepalive
-        expiry = None
-        if self._version == "5.0":
-            expiry = 0
-            if connect_packet.properties is not None and connect_packet.properties.session_expiry_interval is not None:
-                expiry = connect_packet.properties.session_expiry_interval
-        if properties is not None:
-            if not client_id and properties.assigned_client_identifier is not None:
-                client_id = properties.assigned_client_identifier
-            if properties.server_keep_alive is not None:
-                keepalive = properties.server_keep_alive
-            if self._version == "5.0" and properties.session_expiry_interval is not None:
-                expiry = properties.session_expiry_interval
-        info = ConnectionInfo(
+        info = ConnectionInfo.from_connack(
+            connect_packet,
+            connack,
+            version=self._version,
             connection_id=self._connection_id + 1,
-            session_present=connack.session_present,
-            return_code=connack.return_code,
-            properties=properties,
-            effective_client_id=client_id,
-            effective_keepalive=keepalive,
-            effective_session_expiry_interval=expiry,
         )
         self._protocol = protocol
         self._connection_info = info
