@@ -1,3 +1,5 @@
+from zmqtt._internal.packets.properties import ConnAckProperties
+
 _REJECTION_THRESHOLD = 0x80
 
 
@@ -8,8 +10,12 @@ class MQTTError(Exception):
 class MQTTConnectError(MQTTError):
     """CONNACK returned a non-zero return code."""
 
-    def __init__(self, return_code: int) -> None:
+    def __init__(self, return_code: int, *, properties: ConnAckProperties | None = None) -> None:
         self.return_code = return_code
+        self.properties = properties
+        self.reason_string = properties.reason_string if properties is not None else None
+        self.user_properties = properties.user_properties if properties is not None else ()
+        self.server_reference = properties.server_reference if properties is not None else None
         super().__init__(f"Connection refused: return code {return_code}")
 
 

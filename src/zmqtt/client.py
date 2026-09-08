@@ -13,9 +13,10 @@ from typing import Final, Literal, Protocol, overload
 
 from zmqtt._internal._compat import ExceptionGroup, Self, defer_cancellation
 from zmqtt._internal.packets.auth import Auth
-from zmqtt._internal.packets.connect import Connect, Will
+from zmqtt._internal.packets.connect import ConnAck, Connect, Will
 from zmqtt._internal.packets.properties import (
     AuthProperties,
+    ConnAckProperties,
     ConnectProperties,
     PublishProperties,
 )
@@ -35,6 +36,7 @@ from zmqtt._internal.types.topic import validate_publish, validate_response_topi
 from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError, MQTTUnsubscribeError
 
 __all__ = (
+    "ConnectionInfo",
     "MQTTClient",
     "MQTTClientV5",
     "MQTTClientV311",
@@ -50,6 +52,66 @@ TransportFactory = Callable[[str, int, ssl.SSLContext | bool | None], Awaitable[
 _MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ConnectionInfo:
+    """Immutable snapshot of a successful CONNECT/CONNACK handshake.
+
+    Attributes:
+        connection_id: Successful network connection number within this client,
+            starting at 1. A resumed MQTT session still gets a new number.
+        session_present: Whether the broker resumed an existing MQTT session.
+        return_code: Successful CONNACK return code (0).
+        properties: Raw CONNACK properties, without substituted defaults.
+        effective_client_id: Sent client ID, or the broker-assigned ID if empty.
+        effective_keepalive: Server Keep Alive, falling back to CONNECT keepalive.
+        effective_session_expiry_interval: CONNACK session expiry, falling back
+            to CONNECT and then 0. None for MQTT 3.1.1.
+    """
+
+    connection_id: int
+    session_present: bool
+    return_code: int
+    properties: ConnAckProperties | None
+    effective_client_id: str
+    effective_keepalive: int
+    effective_session_expiry_interval: int | None
+
+    @classmethod
+    def from_connack(
+        cls,
+        connect_packet: Connect,
+        connack: ConnAck,
+        *,
+        version: Literal["3.1.1", "5.0"],
+        connection_id: int,
+    ) -> Self:
+        """Build a snapshot from a successful CONNECT/CONNACK exchange."""
+        properties = connack.properties
+        client_id = connect_packet.client_id
+        keepalive = connect_packet.keepalive
+        expiry = None
+        if version == "5.0":
+            expiry = 0
+            if connect_packet.properties is not None and connect_packet.properties.session_expiry_interval is not None:
+                expiry = connect_packet.properties.session_expiry_interval
+        if properties is not None:
+            if not client_id and properties.assigned_client_identifier is not None:
+                client_id = properties.assigned_client_identifier
+            if properties.server_keep_alive is not None:
+                keepalive = properties.server_keep_alive
+            if version == "5.0" and properties.session_expiry_interval is not None:
+                expiry = properties.session_expiry_interval
+        return cls(
+            connection_id=connection_id,
+            session_present=connack.session_present,
+            return_code=connack.return_code,
+            properties=properties,
+            effective_client_id=client_id,
+            effective_keepalive=keepalive,
+            effective_session_expiry_interval=expiry,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -107,6 +169,9 @@ class MQTTClientV311(Protocol):
         receive_buffer_size: int = 1000,
     ) -> "Subscription": ...
 
+    @property
+    def connection_info(self) -> ConnectionInfo: ...
+
     async def connect(self) -> None: ...
 
     async def disconnect(self) -> None: ...
@@ -119,6 +184,9 @@ class MQTTClientV5(Protocol):
 
     async def __aenter__(self) -> Self: ...
     async def __aexit__(self, *exc: object) -> None: ...
+
+    @property
+    def connection_info(self) -> ConnectionInfo: ...
 
     async def connect(self) -> None: ...
 
@@ -497,10 +565,29 @@ class MQTTClient:
         self._request_dispatcher = _RequestDispatcher(max_pending_requests)
         self._session_replay_buffer_size = session_replay_buffer_size
         self._session_replay_timeout = session_replay_timeout
+        self._connection_info: ConnectionInfo | None = None
+        self._connection_id = 0
         self._protocol: MQTTProtocol | None = None
         self._subscriptions: list[Subscription] = []
         self._run_task: asyncio.Task[None] | None = None
         self._subscription_failure: asyncio.Future[BaseException] | None = None
+
+    @property
+    def connection_info(self) -> ConnectionInfo:
+        """Current successful handshake.
+
+        Subscription restoration may still be in progress. Previously returned
+        snapshots remain valid after disconnection. Effective values describe
+        negotiation; they do not change ping scheduling or future CONNECT IDs.
+
+        Raises:
+            MQTTDisconnectedError: If no successful connection is active,
+                including before connecting and during reconnection.
+        """
+        if self._connection_info is None:
+            msg = "No active connection information"
+            raise MQTTDisconnectedError(msg)
+        return self._connection_info
 
     async def __aenter__(self) -> Self:
         """Connect to the broker and start the background run loop."""
@@ -512,6 +599,7 @@ class MQTTClient:
 
     def _notify_subscription_failure(self, run_task: asyncio.Task[None]) -> None:
         """Wake subscription consumers if the client run loop failed."""
+        self._connection_info = None
         if run_task.cancelled():
             return
         failure = run_task.exception()
@@ -521,6 +609,7 @@ class MQTTClient:
 
     async def __aexit__(self, *exc: object) -> None:
         """Disconnect cleanly and cancel the run loop."""
+        self._connection_info = None
         async with defer_cancellation():
             await self._request_dispatcher.cancel_pending()
             if self._run_task is not None:
@@ -827,11 +916,19 @@ class MQTTClient:
             properties=connect_props,
         )
         try:
-            await protocol.connect(connect_packet)
+            connack = await protocol.connect(connect_packet)
         except BaseException:
             await transport.close()
             raise
+        info = ConnectionInfo.from_connack(
+            connect_packet,
+            connack,
+            version=self._version,
+            connection_id=self._connection_id + 1,
+        )
         self._protocol = protocol
+        self._connection_info = info
+        self._connection_id = info.connection_id
         self._request_dispatcher.bind(protocol)
 
     async def _connect_with_retry(self, *, wait_before_first_attempt: bool = False) -> None:
@@ -878,6 +975,7 @@ class MQTTClient:
                 await protocol_run_task
 
             except (MQTTDisconnectedError, MQTTTimeoutError):
+                self._connection_info = None
                 if not self._reconnect.enabled:
                     await self._notify_connection_recovery_failed()
                     raise
@@ -886,6 +984,10 @@ class MQTTClient:
                     await self._protocol._transport.close()
             else:
                 return  # clean disconnect — protocol.disconnect() was called
+            finally:
+                self._connection_info = None
+                protocol_run_task.cancel()
+                await asyncio.gather(protocol_run_task, return_exceptions=True)
 
             subs_to_restore = list(self._subscriptions)
             log.warning("Connection lost, reconnecting...")

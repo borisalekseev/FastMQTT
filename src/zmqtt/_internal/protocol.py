@@ -230,7 +230,7 @@ class MQTTProtocol:
                     msg = f"Expected CONNACK, got {pkt!r}"
                     raise MQTTProtocolError(msg)
                 if pkt.return_code != 0:
-                    raise MQTTConnectError(pkt.return_code)
+                    raise MQTTConnectError(pkt.return_code, properties=pkt.properties)
                 log.info("Connected with session_present=%s", pkt.session_present)
                 self.inbound.begin_session(session_present=pkt.session_present)
                 return pkt
