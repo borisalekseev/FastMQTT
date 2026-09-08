@@ -150,7 +150,6 @@ class TestMosquittoV5(BaseTestMosquitto):
         denied_filter = f"zmqtt/unsuback/denied/{suffix}"
         sub = mqtt_client.subscribe(allowed_filter, denied_filter)
 
-        # Act
         await sub.start()
         with pytest.raises(MQTTUnsubscribeError) as exc_info:
             await sub.stop()
@@ -164,7 +163,6 @@ class TestMosquittoV5(BaseTestMosquitto):
         await mqtt_client.publish(denied_filter, b"still-subscribed-after-reconnect")
         message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
 
-        # Assert
         assert exc_info.value.failures == {denied_filter: 0x87}
         assert reconnect_message.payload == b"reconnect-ready"
         assert message.topic == denied_filter

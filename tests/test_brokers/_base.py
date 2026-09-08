@@ -191,16 +191,12 @@ class BrokerTestBase(abc.ABC):
         mqtt_client: MQTTClient,
         topic: str,
     ) -> None:
-        """Stopping after disconnect detaches the subscription without network cleanup."""
-
         subscription = mqtt_client.subscribe(topic)
 
-        # Act
         await subscription.start()
         await mqtt_client.disconnect()
         await subscription.stop()
 
-        # Assert
         assert subscription not in mqtt_client._subscriptions
 
     async def test_unsubscribe_identifier_preserves_other_subscription(

@@ -148,7 +148,6 @@ async def test_stop_completes_when_messages_precede_unsuback() -> None:
     client = MQTTClient("localhost", version="5.0", transport_factory=factory)
     subscription = client.subscribe("topic", receive_buffer_size=1)
 
-    # Act
     async with client:
         transport.packet_sent.clear()
         started = asyncio.create_task(subscription.start())
@@ -188,7 +187,6 @@ async def test_stop_completes_when_messages_precede_unsuback() -> None:
         await asyncio.wait_for(stopped, timeout=0.2)
         detached = subscription not in client._subscriptions
 
-    # Assert
     assert detached
 
 
@@ -268,7 +266,6 @@ async def test_cancellation_completes_when_unsuback_is_withheld() -> None:
 
     client = MQTTClient("localhost", version="5.0", transport_factory=factory)
 
-    # Act
     async with client:
         transport.packet_sent.clear()
         task = asyncio.create_task(consume(client))
@@ -288,7 +285,6 @@ async def test_cancellation_completes_when_unsuback_is_withheld() -> None:
         transport.feed(encode(PingResp(), version="5.0"))
         rtt = await ping
 
-    # Assert
     assert rtt >= 0
 
 
@@ -309,7 +305,6 @@ async def test_stop_preserves_unsuback_error_when_observer_resubscribe_fails() -
     client = MQTTClient("localhost", version="5.0", transport_factory=factory)
     subscription = client.subscribe(allowed_filter, denied_filter, reply_filter)
 
-    # Act
     async with client:
         transport.packet_sent.clear()
         started = asyncio.create_task(subscription.start())
@@ -358,7 +353,6 @@ async def test_stop_preserves_unsuback_error_when_observer_resubscribe_fails() -
         )
         replacement_message = await asyncio.wait_for(replacement.get_message(), timeout=0.2)
 
-    # Assert
     errors = exc_info.value.exceptions
     assert any(isinstance(error, MQTTUnsubscribeError) for error in errors)
     assert any(isinstance(error, MQTTSubscribeError) for error in errors)
