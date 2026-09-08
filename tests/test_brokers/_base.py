@@ -181,6 +181,23 @@ class BrokerTestBase(abc.ABC):
         message = await asyncio.wait_for(concrete.get_message(), timeout=5.0)
         assert message.payload == b"exact-remains"
 
+    async def test_stop_after_disconnect_detaches_subscription(
+        self,
+        mqtt_client: MQTTClient,
+        topic: str,
+    ) -> None:
+        """Stopping after disconnect detaches the subscription without network cleanup."""
+
+        subscription = mqtt_client.subscribe(topic)
+
+        # Act
+        await subscription.start()
+        await mqtt_client.disconnect()
+        await subscription.stop()
+
+        # Assert
+        assert subscription not in mqtt_client._subscriptions
+
     async def test_unsubscribe_identifier_preserves_other_subscription(
         self,
         mqtt_client: MQTTClient,

@@ -226,12 +226,13 @@ class Subscription:
         return None
 
     async def _unsubscribe_for_exit(self, *, cancelled: bool) -> None:
-        """Send UNSUBSCRIBE, allowing it to finish when cancellation is pending."""
+        """Unsubscribe normally, or detach locally while cancellation is pending."""
         if not cancelled:
             await self._stop()
             return
-        async with defer_cancellation():
-            await self._stop()
+
+        self._registered_filters = []
+        self._detach()
 
     def _handle_unsubscribe_rejection(
         self,
@@ -256,13 +257,24 @@ class Subscription:
             return
         protocol = self._client._protocol
         if protocol is None:
-            msg = "Not connected"
-            raise MQTTDisconnectedError(msg)
+            self._registered_filters = []
+            self._detach()
+            return
 
         try:
             await protocol.unsubscribe(self._registered_filters)
         except MQTTUnsubscribeError as error:
             self._registered_filters = [filter_ for filter_ in self._registered_filters if filter_ in error.failures]
+            raise
+        except ExceptionGroup as error:
+            unsubscribe_error = next(
+                (item for item in error.exceptions if isinstance(item, MQTTUnsubscribeError)),
+                None,
+            )
+            if unsubscribe_error is not None:
+                self._registered_filters = [
+                    filter_ for filter_ in self._registered_filters if filter_ in unsubscribe_error.failures
+                ]
             raise
 
         self._registered_filters = []
@@ -272,7 +284,8 @@ class Subscription:
         if self in self._client._subscriptions:
             self._client._subscriptions.remove(self)
 
-    async def _do_subscribe(self, protocol: MQTTProtocol) -> None:
+    async def _do_subscribe(self, protocol: MQTTProtocol, filters: list[str] | None = None) -> None:
+        filters = self._filters if filters is None else filters
         reqs = [
             SubscriptionRequest(
                 topic_filter=f,
@@ -281,7 +294,7 @@ class Subscription:
                 retain_as_published=self._retain_as_published,
                 retain_handling=self._retain_handling,
             )
-            for f in self._filters
+            for f in filters
         ]
         _, queues = await protocol.subscribe(
             reqs,
@@ -293,7 +306,7 @@ class Subscription:
 
     async def _reconnect(self, protocol: MQTTProtocol) -> None:
         """Re-subscribe on a fresh protocol after reconnection."""
-        await self._do_subscribe(protocol)
+        await self._do_subscribe(protocol, self._registered_filters)
 
     async def start(self) -> None:
         """Register the subscription filters with the broker.

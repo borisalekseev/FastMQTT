@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator, Iterable
 from typing import Final, Literal
 
 from zmqtt._internal import topic_matching
+from zmqtt._internal._compat import ExceptionGroup
 from zmqtt._internal.inbound import InboundPublishFlow
 from zmqtt._internal.packets.auth import Auth
 from zmqtt._internal.packets.codec import AnyPacket, encode
@@ -414,7 +415,19 @@ class MQTTProtocol:
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
         broker_filters = [f for f in filters if f not in observed_filters]
 
-        unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
+        removed_broker_entries = {
+            filter_: entry
+            for filter_ in broker_filters
+            if (entry := self._state.subscriptions.get(filter_)) is not None
+        }
+        for filter_ in removed_broker_entries:
+            self._state.subscriptions.remove(filter_)
+
+        try:
+            unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
+        except BaseException:
+            self._state.subscriptions.add_many(removed_broker_entries)
+            raise
         unsubscribe_error = _unsubscribe_error(broker_filters, unsuback) if unsuback is not None else None
 
         if unsubscribe_error is None:
@@ -425,12 +438,33 @@ class MQTTProtocol:
                 for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True)
                 if reason_code in _UNSUBACK_SUCCESS_CODES
             ]
+            rejected_broker_filters = [
+                filter_
+                for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True)
+                if reason_code not in _UNSUBACK_SUCCESS_CODES
+            ]
+            self._state.subscriptions.add_many(
+                {
+                    filter_: removed_broker_entries[filter_]
+                    for filter_ in rejected_broker_filters
+                    if filter_ in removed_broker_entries
+                },
+            )
 
         for filter_ in [*observed_filters, *successful_broker_filters]:
             self._state.subscriptions.remove(filter_)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
-            await self._send_subscribe(requests, subscription_identifier=None)
+            try:
+                await self._send_subscribe(requests, subscription_identifier=None)
+            except Exception as observer_error:
+                if unsubscribe_error is not None:
+                    msg = "subscription cleanup failed"
+                    raise ExceptionGroup(
+                        msg,
+                        [unsubscribe_error, observer_error],
+                    ) from None
+                raise
 
         if unsubscribe_error is not None:
             raise unsubscribe_error

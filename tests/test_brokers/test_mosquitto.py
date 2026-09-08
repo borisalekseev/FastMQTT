@@ -142,6 +142,34 @@ class TestMosquittoV5(BaseTestMosquitto):
         with pytest.raises(asyncio.TimeoutError):  # trying to get msg from unsubscribed filter
             await asyncio.wait_for(sub.get_message(), timeout=0.5)
 
+    async def test_reconnect_restores_only_filter_rejected_by_unsuback(self, mqtt_client: MQTTClient) -> None:
+        """After reconnect, only the filter rejected by UNSUBACK receives messages."""
+
+        suffix = uuid.uuid4().hex
+        allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
+        denied_filter = f"zmqtt/unsuback/denied/{suffix}"
+        sub = mqtt_client.subscribe(allowed_filter, denied_filter)
+
+        # Act
+        await sub.start()
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
+            await sub.stop()
+
+        await mqtt_client.publish(denied_filter, b"reconnect-ready", retain=True)
+        await asyncio.wait_for(sub.get_message(), timeout=5.0)
+        await self.force_tcp_disconnect(mqtt_client)
+        reconnect_message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
+        await mqtt_client.publish(allowed_filter, b"must-not-return")
+        await mqtt_client.publish(denied_filter, b"still-subscribed-after-reconnect")
+        message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
+        # Assert
+        assert exc_info.value.failures == {denied_filter: 0x87}
+        assert reconnect_message.payload == b"reconnect-ready"
+        assert message.topic == denied_filter
+        assert message.payload == b"still-subscribed-after-reconnect"
+
     async def test_rejected_subscription_cleanup_preserves_body_error(self, mqtt_client: MQTTClient) -> None:
         denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
         body_error = RuntimeError("application failed")
