@@ -1,3 +1,6 @@
+from zmqtt._internal.packets.properties import DisconnectProperties
+
+
 class MQTTError(Exception):
     """Base class for all zmqtt exceptions."""
 
@@ -16,6 +19,22 @@ class MQTTProtocolError(MQTTError):
 
 class MQTTDisconnectedError(MQTTError):
     """Connection lost unexpectedly."""
+
+    def __init__(
+        self,
+        msg: str,
+        reason_code: int | None = None,
+        properties: DisconnectProperties | None = None,
+        *,
+        is_broker_disconnected: bool = False,
+    ) -> None:
+        self.reason_code = reason_code
+        self.properties = properties
+        self.reason_string = properties.reason_string if properties is not None else None
+        self.user_properties = properties.user_properties if properties is not None else ()
+        self.server_reference = properties.server_reference if properties is not None else None
+        self.is_broker_disconnected = is_broker_disconnected
+        super().__init__(msg)
 
 
 class MQTTTimeoutError(MQTTError):

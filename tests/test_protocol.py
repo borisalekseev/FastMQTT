@@ -9,13 +9,14 @@ import contextlib
 import logging
 from collections import deque
 from typing import Literal
+from unittest.mock import AsyncMock
 
 import pytest
 
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck, Connect
 from zmqtt._internal.packets.disconnect import Disconnect
-from zmqtt._internal.packets.properties import PublishProperties
+from zmqtt._internal.packets.properties import DisconnectProperties, PublishProperties
 from zmqtt._internal.packets.publish import PubAck, Publish, PubRec, PubRel
 from zmqtt._internal.packets.reader import PacketBuffer
 from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest
@@ -474,6 +475,94 @@ async def test_broker_disconnect_is_a_disconnection() -> None:
 
     with pytest.raises(MQTTDisconnectedError):
         await asyncio.wait_for(protocol._read_loop(), timeout=1)
+
+
+async def test_disconnect_with_properties_mqtt5() -> None:
+    protocol, _ = make_protocol(version="5.0")
+
+    properties = DisconnectProperties(
+        reason_string="admin kick",
+        server_reference="mqtt2.example.com:1883",
+        user_properties=(
+            ("key1", "value1"),
+            ("key2", "value2"),
+            ("key1", "value3"),
+        ),
+    )
+
+    disconnect = Disconnect(reason_code=0x82, properties=properties)
+
+    with pytest.raises(MQTTDisconnectedError) as ex:
+        await protocol._dispatch(disconnect)
+
+    error = ex.value
+    assert error.is_broker_disconnected is True
+    assert error.reason_code == 0x82
+    assert error.properties is properties
+    assert error.reason_string == "admin kick"
+    assert error.server_reference == "mqtt2.example.com:1883"
+    assert error.user_properties == (
+        ("key1", "value1"),
+        ("key2", "value2"),
+        ("key1", "value3"),
+    )
+
+
+async def test_disconnect_without_properties_mqtt311() -> None:
+    protocol, _ = make_protocol(version="3.1.1")
+
+    disconnect = Disconnect(reason_code=0x00)
+
+    with pytest.raises(MQTTDisconnectedError) as ex:
+        await protocol._dispatch(disconnect)
+
+    error = ex.value
+    assert error.is_broker_disconnected is True
+    assert error.reason_code == 0x00
+    assert error.properties is None
+    assert error.reason_string is None
+    assert error.server_reference is None
+    assert error.user_properties == ()
+
+
+async def test_disconnect_distinguished_from_transport_error() -> None:
+    protocol, _ = make_protocol(version="5.0")
+
+    disconnect = Disconnect(reason_code=0x80)
+    with pytest.raises(MQTTDisconnectedError) as exc_info:
+        await protocol._dispatch(disconnect)
+
+    assert exc_info.value.is_broker_disconnected is True
+    assert exc_info.value.reason_code == 0x80
+
+    with pytest.raises(MQTTDisconnectedError) as exc_info:
+        raise MQTTDisconnectedError(msg="Connection lost")
+
+    assert exc_info.value.is_broker_disconnected is False
+    assert exc_info.value.reason_code is None
+
+
+async def test_disconnect_callback_called_before_raise() -> None:
+    protocol, _ = make_protocol(version="5.0")
+
+    callback = AsyncMock()
+    protocol.add_disconnect_callback(callback)
+
+    properties = DisconnectProperties(
+        reason_string="admin kick", server_reference="mqtt2.example.com:1883", user_properties=(("test", "value"),)
+    )
+    disconnect = Disconnect(reason_code=0x80, properties=properties)
+
+    with pytest.raises(MQTTDisconnectedError):
+        await protocol._dispatch(disconnect)
+
+    callback.assert_awaited_once()
+    error_arg = callback.call_args[0][0]
+    assert error_arg.reason_code == 0x80
+    assert error_arg.reason_string == "admin kick"
+    assert error_arg.server_reference == "mqtt2.example.com:1883"
+    assert error_arg.user_properties == (("test", "value"),)
+    assert error_arg.is_broker_disconnected is True
 
 
 async def test_dead_protocol_refuses_new_operations() -> None:

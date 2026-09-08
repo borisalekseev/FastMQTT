@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from typing import Final, Literal
 
 from zmqtt._internal import topic_matching
@@ -172,6 +172,7 @@ class MQTTProtocol:
         self._disconnecting = False
         self._dead = False
         self.started_event = asyncio.Event()
+        self._disconnect_callbacks: list[Callable[[MQTTDisconnectedError], Awaitable[None]]] = []
 
     async def connect(self, packet: Connect) -> ConnAck:
         """Send CONNECT, read and return CONNACK. Raises on failure.
@@ -534,12 +535,11 @@ class MQTTProtocol:
                 await self._handle_unsuback(packet)
             case PingResp():
                 self._handle_pingresp()
-            case Disconnect(reason_code=reason_code):
+            case Disconnect():
                 # A broker-initiated DISCONNECT (session takeover, keepalive timeout,
                 # admin kick) is a disconnection, not a protocol violation — raise it
                 # as MQTTDisconnectedError so it takes the reconnect path.
-                msg = f"Broker sent DISCONNECT (reason code 0x{reason_code:02X})"
-                raise MQTTDisconnectedError(msg)
+                await self._handle_disconnect(packet)
             case Auth():
                 if self._version != "5.0":
                     msg = "Received AUTH packet in MQTT 3.1.1 session"
@@ -551,8 +551,40 @@ class MQTTProtocol:
                 msg = f"Unexpected packet from broker: {packet!r}"
                 raise MQTTProtocolError(msg)
 
+    def add_disconnect_callback(self, callback: Callable[[MQTTDisconnectedError], Awaitable[None]]) -> None:
+        """Register a callback for observing a broker-initiated DISCONNECT"""
+        self._disconnect_callbacks.append(callback)
+
     def _select_recipient(self, publish: Publish) -> InboundRecipient:
         return self.inbound.select_recipient(publish)
+
+    async def _handle_disconnect(self, packet: Disconnect) -> None:
+        """Handle broker-initiated DISCONNECT"""
+        reason_code = packet.reason_code
+        properties = packet.properties
+
+        msg = f"Broker sent DISCONNECT (reason code 0x{reason_code:02X})"
+
+        if self._version == "5.0" and properties:
+            error = MQTTDisconnectedError(
+                msg=msg,
+                reason_code=reason_code,
+                properties=properties,
+                is_broker_disconnected=True,
+            )
+        else:
+            error = MQTTDisconnectedError(
+                msg=msg,
+                reason_code=reason_code,
+                is_broker_disconnected=True,
+            )
+        try:
+            for callback in self._disconnect_callbacks:
+                await callback(error)
+        except Exception:
+            log.exception("Disconnect callback failed")
+
+        raise error
 
     async def _handle_publish(self, packet: Publish) -> None:
         await self.inbound.handle_publish(packet)
