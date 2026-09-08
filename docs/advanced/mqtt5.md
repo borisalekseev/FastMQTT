@@ -13,6 +13,40 @@ async with create_client("localhost", version="5.0") as client:
 
 The return type is `MQTTClientV5`, which exposes 5.0-specific methods and accepts 5.0-specific parameters.
 
+## Connection information
+
+`client.connection_info` returns an immutable `ConnectionInfo` snapshot of the
+current successful handshake on all client types, including MQTT 3.1.1:
+
+```python
+async with create_client("localhost", version="5.0") as client:
+    info = client.connection_info
+    print(info.connection_id, info.session_present)
+    print(info.effective_client_id, info.effective_keepalive)
+    print(info.effective_session_expiry_interval)
+    if info.properties is not None:
+        print(info.properties.response_information)
+        print(info.properties.user_properties)
+```
+
+`properties` holds raw `ConnAckProperties` without defaults, or `None` when
+absent. Repeated User Properties retain their order. Effective values use the
+broker's Assigned Client Identifier when CONNECT sent an empty ID, Server Keep
+Alive over CONNECT's keepalive, and CONNACK session expiry over CONNECT's expiry
+(default `0`). Explicit zero values are preserved; MQTT 3.1.1 has no properties
+or session expiry. See the [MQTT 5.0 specification, CONNACK properties](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901086).
+
+Access raises `MQTTDisconnectedError` before connecting, during retries, and
+after disconnection or background-loop failure. Each successful handshake gets
+a new `connection_id`, starting at 1, even when the MQTT session resumes.
+Failed attempts do not increment it; saved snapshots remain unchanged.
+Subscription restoration may still be running when the snapshot becomes available.
+
+Effective values describe negotiation; they do not change ping scheduling,
+future CONNECT IDs, or enforce broker limits. Response Information is the raw
+broker string and does not alter reply topics or `request()`. Requesting it in
+CONNECT is not currently exposed by the client configuration.
+
 ## Session expiry interval
 
 Controls how long the broker preserves your session after disconnect. `0` (default) means the session ends immediately on disconnect; `0xFFFFFFFF` means the session never expires.

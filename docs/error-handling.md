@@ -44,6 +44,26 @@ except MQTTConnectError as e:
     print(f"Broker refused connection: code {e.return_code}")
 ```
 
+For MQTT 5.0, `e.properties` contains the received `ConnAckProperties`.
+Convenience attributes expose the broker's diagnostics:
+
+```python
+try:
+    async with create_client("localhost", version="5.0") as client:
+        ...
+except MQTTConnectError as e:
+    print(e.return_code, e.reason_string, e.server_reference)
+    for key, value in e.user_properties:
+        print(key, value)
+```
+
+Without properties (including MQTT 3.1.1), `properties`, `reason_string`, and
+`server_reference` are `None`, and `user_properties` is `()`. Repeated User
+Properties preserve their original order. The positional constructor
+`MQTTConnectError(return_code)` and exception text remain unchanged; properties
+can also be supplied with the optional keyword argument `properties=...`.
+A refused connection does not publish `client.connection_info`.
+
 Common return codes (MQTT 3.1.1):
 
 | Code | Meaning |
