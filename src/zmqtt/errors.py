@@ -21,6 +21,19 @@ class MQTTProtocolError(MQTTError):
     """Unexpected or malformed packet received."""
 
 
+class MQTTQoSExceededError(MQTTError):
+    """A PUBLISH requested a QoS higher than the server's advertised Maximum QoS.
+
+    Raised locally, before the packet is sent — the server would otherwise
+    have to reject or drop it (MQTT 5.0 §3.2.2.3.4).
+    """
+
+    def __init__(self, requested: int, maximum: int) -> None:
+        self.requested_qos = requested
+        self.maximum_qos = maximum
+        super().__init__(f"Requested QoS {requested} exceeds the server's Maximum QoS {maximum}")
+
+
 class MQTTDisconnectedError(MQTTError):
     """Connection lost unexpectedly."""
 
