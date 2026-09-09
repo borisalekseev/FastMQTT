@@ -50,6 +50,9 @@ TransportFactory = Callable[[str, int, ssl.SSLContext | bool | None], Awaitable[
 # MQTT 5.0 §3.8.2.1.2: a subscription identifier is a variable-byte integer.
 _MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455
 
+# MQTT 5.0 §3.3.2.3.4: a topic alias is a non-zero two-byte integer.
+_MAX_TOPIC_ALIAS = 65_535
+
 log = logging.getLogger(__name__)
 
 
@@ -599,6 +602,8 @@ class MQTTClient:
                 ``$`` in a non-leading position.
             MQTTDisconnectedError: If the client is not currently connected.
             RuntimeError: If *properties* is supplied on an MQTT 3.1.1 connection.
+            ValueError: If the topic alias is outside 1..65535 or exceeds the
+                server's Topic Alias Maximum for the current connection.
             MQTTPublishError: If the broker rejects a QoS 1/2 publish. Not raised for QoS 0 or MQTT 3.1.1.
         """
         validate_publish(topic)
@@ -608,6 +613,16 @@ class MQTTClient:
         if properties is not None and self._version != "5.0":
             msg = "properties require MQTT 5.0"
             raise RuntimeError(msg)
+        if properties is not None and properties.topic_alias is not None:
+            alias = properties.topic_alias
+            if not 1 <= alias <= _MAX_TOPIC_ALIAS:
+                msg = "topic_alias must be between 1 and 65535"
+                raise ValueError(msg)
+            connack_properties = self.connection_info.properties
+            maximum = 0 if connack_properties is None else (connack_properties.topic_alias_maximum or 0)
+            if alias > maximum:
+                msg = f"topic_alias {alias} exceeds server Topic Alias Maximum {maximum}"
+                raise ValueError(msg)
         if isinstance(payload, str):
             payload = payload.encode()
         await self._protocol.publish(
@@ -757,7 +772,8 @@ class MQTTClient:
             MQTTDisconnectedError: If the request cannot start because the client
                 is disconnected, or the client is stopped while waiting.
             ValueError: If the same response topic and correlation data are
-                already used by another active request.
+                already used by another active request. Also raised if the topic
+                alias is outside 1..65535 or exceeds the server's Topic Alias Maximum.
             asyncio.TimeoutError: If no matching reply arrives within *timeout*
                 seconds.
         """

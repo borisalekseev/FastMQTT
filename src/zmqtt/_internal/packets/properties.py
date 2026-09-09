@@ -253,8 +253,8 @@ class PublishProperties:
             encoded character data.
         message_expiry_interval: Seconds the broker retains the message. Omit to
             keep indefinitely.
-        topic_alias: Topic alias integer used instead of the full topic string on
-            the wire.
+        topic_alias: Topic alias integer (1..65535). Outgoing aliases must not
+            exceed the server's Topic Alias Maximum for the current connection.
         response_topic: Topic the receiver should use when replying
             (request/response pattern).
         correlation_data: Opaque bytes the sender uses to match a response to a
