@@ -1,4 +1,5 @@
 import asyncio
+import enum
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -6,12 +7,36 @@ from zmqtt._internal.topic_matching import _segment_rank, _topic_matches
 from zmqtt._internal.types.message import Message
 
 
+class EntryState(enum.Enum):
+    """What, if anything, is consuming a filter the broker holds."""
+
+    OWNED = "owned"  # delivery blocks on a full queue, applying backpressure
+    DRAINING = "draining"  # UNSUBSCRIBE in flight: still routable, but delivery must never block
+    RELEASED = "released"  # no consumer; kept registered for a pending request
+
+
 @dataclass(slots=True, kw_only=True)
 class SubscriptionEntry:
-    queue: asyncio.Queue[Message]
+    queue: asyncio.Queue[Message] | None
+    state: EntryState = EntryState.OWNED
+    detached: asyncio.Event = field(default_factory=asyncio.Event)
     auto_ack: bool = True
     actual_filter: str = ""  # filter with broker-stripped subscription decorators removed
     subscription_identifier: int | None = None  # v5; echoed by the broker on PUBLISH
+
+    def transition(self, state: EntryState) -> None:
+        """Move to ``state``, keeping the queue and the detach signal in step.
+
+        Derived here rather than remembered by callers: left set on a consuming
+        entry, every delivery to a full queue is dropped instead of blocking.
+        """
+        self.state = state
+        if state is EntryState.RELEASED:
+            self.queue = None
+        if state is EntryState.OWNED:
+            self.detached.clear()
+        else:
+            self.detached.set()
 
 
 @dataclass(slots=True)
@@ -39,6 +64,10 @@ class SubscriptionIndex:
         if filter_ in self._entries:
             self.remove(filter_)
 
+        self._entries[filter_] = entry
+        self._link(filter_, entry)
+
+    def _link(self, filter_: str, entry: SubscriptionEntry) -> None:
         tree_filter = entry.actual_filter or filter_
         node = self._root
         for part in tree_filter.split("/"):
@@ -46,13 +75,43 @@ class SubscriptionIndex:
             node = mapping.setdefault(part, _Node())
 
         node.entries.append((filter_, entry))
-        self._entries[filter_] = entry
         identifier = entry.subscription_identifier
         if identifier is not None:
             self._by_identifier.setdefault(identifier, {})[filter_] = entry
 
     def contains(self, filter_: str) -> bool:
         return filter_ in self._entries
+
+    def has_consumer(self, filter_: str) -> bool:
+        entry = self._entries.get(filter_)
+        return entry is not None and entry.state is not EntryState.RELEASED
+
+    def start_draining(self, filter_: str) -> bool:
+        """Await the broker's verdict: still registered and routable, but never blocking."""
+        entry = self._entries.get(filter_)
+        if entry is None or entry.state is not EntryState.OWNED:
+            return False
+
+        entry.transition(EntryState.DRAINING)
+        return True
+
+    def stop_draining(self, filter_: str) -> bool:
+        """Resume normal delivery for a filter the broker refused to release."""
+        entry = self._entries.get(filter_)
+        if entry is None or entry.state is not EntryState.DRAINING:
+            return False
+
+        entry.transition(EntryState.OWNED)
+        return True
+
+    def release(self, filter_: str) -> bool:
+        """Give up the consumer while leaving the filter registered at the broker."""
+        entry = self._entries.get(filter_)
+        if entry is None or entry.state is EntryState.RELEASED:
+            return False
+
+        self._unlink(filter_, entry)
+        return True
 
     def add_response_observer(self, topic: str) -> bool:
         """Register an exact response-topic observer.
@@ -81,6 +140,12 @@ class SubscriptionIndex:
         if entry is None:
             return None
 
+        self._unlink(filter_, entry)
+        return entry
+
+    def _unlink(self, filter_: str, entry: SubscriptionEntry) -> None:
+        # Unroutable from here on, so nothing will ever consume this queue again.
+        entry.transition(EntryState.RELEASED)
         tree_filter = entry.actual_filter or filter_
         self._remove_entry(tree_filter.split("/"), filter_, entry, self._root)
 
@@ -91,7 +156,6 @@ class SubscriptionIndex:
                 identified.pop(filter_, None)
                 if not identified:
                     self._by_identifier.pop(identifier)
-        return entry
 
     def clear(self) -> None:
         self._root = _Node()

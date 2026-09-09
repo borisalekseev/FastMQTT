@@ -168,6 +168,42 @@ class TestMosquittoV5(BaseTestMosquitto):
         assert message.topic == denied_filter
         assert message.payload == b"still-subscribed-after-reconnect"
 
+    async def test_context_exit_with_rejected_unsuback_keeps_delivering(self, mqtt_client: MQTTClient) -> None:
+        """Leaving the context manager reports a refusal exactly as stop() does."""
+
+        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
+        subscription = mqtt_client.subscribe(denied_filter)
+
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
+            async with subscription:
+                pass
+
+        await mqtt_client.publish(denied_filter, b"still-subscribed", qos=QoS.AT_LEAST_ONCE)
+        message = await asyncio.wait_for(subscription.get_message(), timeout=5.0)
+        assert exc_info.value.failures == {denied_filter: 0x87}
+        assert message.payload == b"still-subscribed"
+
+    async def test_retried_stop_leaves_replacement_subscription_active(self, mqtt_client: MQTTClient) -> None:
+        """A retry targets only refused filters, never one a newer subscription took over."""
+
+        suffix = uuid.uuid4().hex
+        allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
+        denied_filter = f"zmqtt/unsuback/denied/{suffix}"
+        sub = mqtt_client.subscribe(allowed_filter, denied_filter)
+        await sub.start()
+        with pytest.raises(MQTTUnsubscribeError):
+            await sub.stop()
+        replacement = mqtt_client.subscribe(allowed_filter)
+        await replacement.start()
+
+        with pytest.raises(MQTTUnsubscribeError) as retry_exc_info:
+            await sub.stop()
+
+        await mqtt_client.publish(allowed_filter, b"replacement-still-active", qos=QoS.AT_LEAST_ONCE)
+        message = await asyncio.wait_for(replacement.get_message(), timeout=5.0)
+        assert retry_exc_info.value.failures == {denied_filter: 0x87}
+        assert message.payload == b"replacement-still-active"
+
     async def test_rejected_subscription_cleanup_preserves_body_error(self, mqtt_client: MQTTClient) -> None:
         denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
         body_error = RuntimeError("application failed")

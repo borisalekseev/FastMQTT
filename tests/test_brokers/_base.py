@@ -16,6 +16,7 @@ from typing import ClassVar, Literal
 import pytest
 
 from zmqtt import (
+    Message,
     MQTTClient,
     MQTTDisconnectedError,
     MQTTProtocolError,
@@ -80,6 +81,36 @@ class BrokerTestBase(abc.ABC):
         protocol = client._protocol
         assert protocol is not None
         await protocol._transport.close()
+
+    async def wait_for_buffered(
+        self,
+        subscription: Subscription,
+        *,
+        count: int,
+        timeout: float = 5.0,
+    ) -> None:
+        """Block until the subscription has buffered ``count`` unread messages."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while subscription._queue.qsize() < count:
+            if asyncio.get_running_loop().time() >= deadline:
+                pytest.fail(f"Broker did not deliver {count} messages within {timeout} s")
+            await asyncio.sleep(0.05)
+
+    async def receive_after_reconnect(
+        self,
+        subscription: Subscription,
+        publisher: MQTTClient,
+        topic: str,
+        payload: bytes,
+    ) -> Message:
+        """Publish until the resubscribed consumer receives, or fail the test."""
+        for _ in range(50):
+            await publisher.publish(topic, payload)
+            try:
+                return await asyncio.wait_for(subscription.get_message(), timeout=0.1)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0.1)
+        pytest.fail("Subscription did not recover within 10 s")
 
     def persistent_client(
         self,
@@ -195,6 +226,36 @@ class BrokerTestBase(abc.ABC):
 
         await subscription.start()
         await mqtt_client.disconnect()
+        await subscription.stop()
+
+        assert subscription not in mqtt_client._subscriptions
+
+    async def test_buffered_messages_survive_stop(
+        self,
+        mqtt_client: MQTTClient,
+        topic: str,
+    ) -> None:
+        subscription = mqtt_client.subscribe(topic, qos=QoS.AT_LEAST_ONCE, receive_buffer_size=2)
+        await subscription.start()
+        await mqtt_client.publish(topic, b"first", qos=QoS.AT_LEAST_ONCE)
+        await mqtt_client.publish(topic, b"second", qos=QoS.AT_LEAST_ONCE)
+        await self.wait_for_buffered(subscription, count=2)
+
+        await subscription.stop()
+
+        payloads = [(await asyncio.wait_for(subscription.get_message(), timeout=5.0)).payload for _ in range(2)]
+        assert payloads == [b"first", b"second"]
+
+    async def test_stop_after_unexpected_disconnect_detaches_subscription(
+        self,
+        mqtt_client: MQTTClient,
+        topic: str,
+    ) -> None:
+        subscription = mqtt_client.subscribe(topic)
+        await subscription.start()
+        await self.force_tcp_disconnect(mqtt_client)
+        await asyncio.sleep(0.1)
+
         await subscription.stop()
 
         assert subscription not in mqtt_client._subscriptions
@@ -345,7 +406,6 @@ class BrokerTestBase(abc.ABC):
     async def test_reconnect_subscription_survives(self, topic: str) -> None:
         client_id = f"zmqtt-reconnect-{uuid.uuid4().hex[:8]}"
         reconnect = ReconnectConfig(enabled=True, initial_delay=0.5, max_delay=1.0)
-
         async with (
             MQTTClient(
                 self.host,
@@ -355,20 +415,33 @@ class BrokerTestBase(abc.ABC):
                 version=self.version,
             ) as client,
             client.subscribe(topic) as sub,
+            MQTTClient(self.host, self.port, version=self.version) as publisher,
         ):
             await self.trigger_session_takeover(client_id=client_id)
 
-            async with MQTTClient(self.host, self.port, version=self.version) as publisher:
-                for _ in range(50):
-                    await publisher.publish(topic, b"after-reconnect")
-                    try:
-                        msg = await asyncio.wait_for(sub.get_message(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        await asyncio.sleep(0.1)
-                    else:
-                        break
-                else:
-                    pytest.fail("Subscription did not recover within 10 s")
+            msg = await self.receive_after_reconnect(sub, publisher, topic, b"after-reconnect")
+
+        assert msg.payload == b"after-reconnect"
+
+    async def test_reconnect_with_two_subscriptions_on_one_filter(self, topic: str) -> None:
+        """The second object on a taken filter registers nothing, and an empty SUBSCRIBE is illegal."""
+        client_id = f"zmqtt-shared-filter-{uuid.uuid4().hex[:8]}"
+        reconnect = ReconnectConfig(enabled=True, initial_delay=0.5, max_delay=1.0)
+        async with (
+            MQTTClient(
+                self.host,
+                self.port,
+                client_id=client_id,
+                reconnect=reconnect,
+                version=self.version,
+            ) as client,
+            client.subscribe(topic) as owner,
+            client.subscribe(topic),
+            MQTTClient(self.host, self.port, version=self.version) as publisher,
+        ):
+            await self.trigger_session_takeover(client_id=client_id)
+
+            msg = await self.receive_after_reconnect(owner, publisher, topic, b"after-reconnect")
 
         assert msg.payload == b"after-reconnect"
 

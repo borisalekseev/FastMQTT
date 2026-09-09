@@ -282,15 +282,8 @@ class Subscription:
         """Unsubscribe from all filters and stop message delivery."""
         try:
             await self._unsubscribe_for_exit(cancelled=isinstance(body_error, asyncio.CancelledError))
-        except MQTTUnsubscribeError as cleanup_error:
-            self._handle_unsubscribe_rejection(body_error, cleanup_error)
-        except MQTTDisconnectedError:
-            self._detach()
-        except Exception:
-            if body_error is None:
-                raise
-            log.warning("Subscription cleanup failed", exc_info=True)
-            self._detach()
+        except Exception as cleanup_error:  # noqa: BLE001 - no cleanup failure may be swallowed
+            self._handle_cleanup_failure(body_error, cleanup_error)
         return None
 
     async def _unsubscribe_for_exit(self, *, cancelled: bool) -> None:
@@ -299,24 +292,29 @@ class Subscription:
             await self._stop()
             return
 
+        self._abandon()
+
+    def _abandon(self) -> None:
+        """Detach locally without asking the broker, for a consumer already cancelled."""
+        protocol = self._client._protocol
+        if protocol is not None and protocol.is_alive and self._registered_filters:
+            protocol.release_filters(self._registered_filters)
         self._registered_filters = []
         self._detach()
 
-    def _handle_unsubscribe_rejection(
+    def _handle_cleanup_failure(
         self,
         body_error: BaseException | None,
-        cleanup_error: MQTTUnsubscribeError,
+        cleanup_error: Exception,
     ) -> None:
-        """Raise, combine, or log a rejected UNSUBACK without hiding the body error."""
+        """Raise, combine, or log a cleanup failure without hiding the body error."""
         if body_error is None:
             raise cleanup_error
-        if isinstance(body_error, asyncio.CancelledError):
-            log.warning("Subscription cleanup failed during cancellation", exc_info=cleanup_error)
-            return
         if isinstance(body_error, Exception):
             message = "subscription cleanup failed"
             raise ExceptionGroup(message, [body_error, cleanup_error]) from None
 
+        self._abandon()
         log.warning("Subscription cleanup failed", exc_info=cleanup_error)
 
     async def _stop(self) -> None:
@@ -324,7 +322,7 @@ class Subscription:
             self._detach()
             return
         protocol = self._client._protocol
-        if protocol is None:
+        if protocol is None or not protocol.is_alive:
             self._registered_filters = []
             self._detach()
             return
@@ -332,18 +330,14 @@ class Subscription:
         try:
             await protocol.unsubscribe(self._registered_filters)
         except MQTTUnsubscribeError as error:
+            # A retry must target only what the broker still holds.
             self._registered_filters = [filter_ for filter_ in self._registered_filters if filter_ in error.failures]
             raise
-        except ExceptionGroup as error:
-            unsubscribe_error = next(
-                (item for item in error.exceptions if isinstance(item, MQTTUnsubscribeError)),
-                None,
-            )
-            if unsubscribe_error is not None:
-                self._registered_filters = [
-                    filter_ for filter_ in self._registered_filters if filter_ in unsubscribe_error.failures
-                ]
-            raise
+        except MQTTDisconnectedError:
+            # The session went away mid-flight, and its subscriptions with it.
+            self._registered_filters = []
+            self._detach()
+            return
 
         self._registered_filters = []
         self._detach()
@@ -354,6 +348,10 @@ class Subscription:
 
     async def _do_subscribe(self, protocol: MQTTProtocol, filters: list[str] | None = None) -> None:
         filters = self._filters if filters is None else filters
+        if not filters:
+            # A SUBSCRIBE with no topic filter is a Protocol Error (MQTT 5 3.8.3).
+            self._registered_filters = []
+            return
         reqs = [
             SubscriptionRequest(
                 topic_filter=f,
@@ -762,7 +760,12 @@ class MQTTClient:
                 ``a/b#/c``).
             RuntimeError: If an MQTT 5.0-only subscription option is used on an
                 MQTT 3.1.1 connection.
+            ValueError: If no topic filter is given. A SUBSCRIBE carrying no
+                filter is a Protocol Error (MQTT 5 3.8.3).
         """
+        if not filters:
+            msg = "subscribe() requires at least one topic filter"
+            raise ValueError(msg)
         for f in filters:
             validate_subscribe_topic(f)
         uses_v5_option = no_local or retain_as_published or retain_handling is not RetainHandling.SEND_ON_SUBSCRIBE

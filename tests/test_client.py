@@ -3,18 +3,32 @@
 import asyncio
 import ssl
 from collections import deque
+from typing import TYPE_CHECKING
 
 import pytest
 
-from zmqtt import MQTTClient, MQTTTimeoutError, QoS, ReconnectConfig, Will, WillProperties, create_client
+from zmqtt import (
+    MQTTClient,
+    MQTTTimeoutError,
+    QoS,
+    ReconnectConfig,
+    Subscription,
+    Will,
+    WillProperties,
+    create_client,
+)
 from zmqtt._internal._compat import ExceptionGroup
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck
 from zmqtt._internal.packets.ping import PingResp
 from zmqtt._internal.packets.publish import Publish
 from zmqtt._internal.packets.subscribe import SubAck, UnsubAck
+from zmqtt._internal.subscription_index import EntryState
 from zmqtt._internal.transport.base import Transport
-from zmqtt.errors import MQTTSubscribeError, MQTTUnsubscribeError
+from zmqtt.errors import MQTTDisconnectedError, MQTTProtocolError, MQTTUnsubscribeError
+
+if TYPE_CHECKING:
+    from collections.abc import Coroutine
 
 
 def test_mqtt_connect_timeout_default_is_30s() -> None:
@@ -85,6 +99,98 @@ class FakeTransport:
         return not self.closed
 
 
+class BreakableTransport(FakeTransport):
+    """FakeTransport whose reads start failing once the peer goes away."""
+
+    def __init__(self, feed: bytes | None = None) -> None:
+        super().__init__(feed)
+        self.broken = False
+
+    async def read(self, n: int) -> bytes:  # noqa: ARG002
+        while not self._rx:
+            if self.broken:
+                msg = "Connection lost"
+                raise MQTTDisconnectedError(msg)
+            await asyncio.sleep(0)
+        return self._rx.popleft()
+
+
+CONNACK_V5 = encode(ConnAck(session_present=False, return_code=0), version="5.0")
+
+
+def v5_client(transport: FakeTransport) -> MQTTClient:
+    """MQTT 5.0 client whose only transport is the given fake."""
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        return transport
+
+    return MQTTClient("localhost", version="5.0", transport_factory=factory)
+
+
+async def start_subscription(
+    subscription: Subscription,
+    transport: FakeTransport,
+    *,
+    packet_id: int = 1,
+    return_codes: tuple[int, ...] = (0x00,),
+) -> None:
+    """Complete start() against a SUBACK fed once SUBSCRIBE is on the wire."""
+    transport.packet_sent.clear()
+    started = asyncio.create_task(subscription.start())
+    await transport.packet_sent.wait()
+    transport.feed(encode(SubAck(packet_id=packet_id, return_codes=return_codes), version="5.0"))
+    await started
+
+
+def publish_v5(topic: str, payload: bytes) -> bytes:
+    return encode(
+        Publish(topic=topic, payload=payload, qos=QoS.AT_MOST_ONCE, retain=False, dup=False),
+        version="5.0",
+    )
+
+
+def publish_qos1_v5(topic: str, payload: bytes, *, packet_id: int) -> bytes:
+    return encode(
+        Publish(topic=topic, payload=payload, qos=QoS.AT_LEAST_ONCE, retain=False, dup=False, packet_id=packet_id),
+        version="5.0",
+    )
+
+
+async def hold_subscription(
+    client: MQTTClient,
+    topic: str,
+    entered: asyncio.Event,
+    blocker: asyncio.Event,
+) -> None:
+    """Hold a subscription open until released, for cancellation tests."""
+    async with client.subscribe(topic):
+        entered.set()
+        await blocker.wait()
+
+
+async def fail_inside_subscription(client: MQTTClient, topic: str, error: Exception) -> None:
+    """Raise from the body of a subscription context manager."""
+    async with client.subscribe(topic):
+        raise error
+
+
+async def start_consumer(
+    coro: "Coroutine[object, object, None]",
+    transport: FakeTransport,
+    entered: asyncio.Event,
+    *,
+    packet_id: int = 1,
+) -> "asyncio.Task[None]":
+    """Run a consumer coroutine up to the point where it holds its subscription."""
+    transport.packet_sent.clear()
+    task = asyncio.create_task(coro)
+    await transport.packet_sent.wait()
+    transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x00,)), version="5.0"))
+    await entered.wait()
+
+    return task
+
+
 async def test_connect_retries_after_connack_timeout() -> None:
     connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
     transports = [
@@ -137,224 +243,265 @@ async def test_mqtt_connect_timeout_gives_up_after_max_attempts() -> None:
 async def test_stop_completes_when_messages_precede_unsuback() -> None:
     """A full subscription queue must not block a following UNSUBACK."""
 
-    packet_id = 1
-    transport = FakeTransport(
-        feed=encode(ConnAck(session_present=False, return_code=0), version="5.0"),
-    )
-
-    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
-        return transport
-
-    client = MQTTClient("localhost", version="5.0", transport_factory=factory)
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
     subscription = client.subscribe("topic", receive_buffer_size=1)
-
     async with client:
+        await start_subscription(subscription, transport)
         transport.packet_sent.clear()
-        started = asyncio.create_task(subscription.start())
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x00,)), version="5.0"))
-        await started
 
-        transport.packet_sent.clear()
         stopped = asyncio.create_task(subscription.stop())
         await transport.packet_sent.wait()
-        transport.feed(
-            encode(
-                Publish(
-                    topic="topic",
-                    payload=b"first",
-                    qos=QoS.AT_MOST_ONCE,
-                    retain=False,
-                    dup=False,
-                ),
-                version="5.0",
-            ),
-        )
-
-        transport.feed(
-            encode(
-                Publish(
-                    topic="topic",
-                    payload=b"second",
-                    qos=QoS.AT_MOST_ONCE,
-                    retain=False,
-                    dup=False,
-                ),
-                version="5.0",
-            ),
-        )
-        transport.feed(encode(UnsubAck(packet_id=packet_id, reason_codes=(0x00,)), version="5.0"))
+        transport.feed(publish_v5("topic", b"first"))
+        transport.feed(publish_v5("topic", b"second"))
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00,)), version="5.0"))
         await asyncio.wait_for(stopped, timeout=0.2)
-        detached = subscription not in client._subscriptions
 
-    assert detached
+        assert subscription not in client._subscriptions
 
 
 async def test_full_subscription_queue_delivers_messages_after_consumer_makes_room() -> None:
     """A bounded queue applies backpressure instead of dropping a QoS 1 message."""
 
-    subscription_packet_id = 1
-    transport = FakeTransport(
-        feed=encode(ConnAck(session_present=False, return_code=0), version="5.0"),
-    )
-
-    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
-        return transport
-
-    client = MQTTClient("localhost", version="5.0", transport_factory=factory)
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
     subscription = client.subscribe("topic", auto_ack=False, receive_buffer_size=1)
-
     async with client:
-        transport.packet_sent.clear()
-        started = asyncio.create_task(subscription.start())
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=subscription_packet_id, return_codes=(0x00,)), version="5.0"))
-        await started
-
-        transport.feed(
-            encode(
-                Publish(
-                    topic="topic",
-                    payload=b"first",
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=False,
-                    dup=False,
-                    packet_id=2,
-                ),
-                version="5.0",
-            ),
-        )
-        transport.feed(
-            encode(
-                Publish(
-                    topic="topic",
-                    payload=b"second",
-                    qos=QoS.AT_LEAST_ONCE,
-                    retain=False,
-                    dup=False,
-                    packet_id=3,
-                ),
-                version="5.0",
-            ),
-        )
+        await start_subscription(subscription, transport)
+        for packet_id, payload in ((2, b"first"), (3, b"second")):
+            transport.feed(publish_qos1_v5("topic", payload, packet_id=packet_id))
 
         first = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
         await first.ack()
         second = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
         await second.ack()
 
-    assert [first.payload, second.payload] == [b"first", b"second"]
+        assert [first.payload, second.payload] == [b"first", b"second"]
 
 
 async def test_cancellation_completes_when_unsuback_is_withheld() -> None:
     """Cancellation must complete when the broker withholds UNSUBACK."""
 
-    packet_id = 1
-    transport = FakeTransport(
-        feed=encode(ConnAck(session_present=False, return_code=0), version="5.0"),
-    )
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
     entered = asyncio.Event()
     blocker = asyncio.Event()
-
-    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
-        return transport
-
-    async def consume(client: MQTTClient) -> None:
-        async with client.subscribe("topic"):
-            entered.set()
-            await blocker.wait()
-
-    client = MQTTClient("localhost", version="5.0", transport_factory=factory)
-
     async with client:
-        transport.packet_sent.clear()
-        task = asyncio.create_task(consume(client))
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x00,)), version="5.0"))
-        await entered.wait()
-
+        task = await start_consumer(hold_subscription(client, "topic", entered, blocker), transport, entered)
         packets_before_cancellation = len(transport.sent)
+
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=0.2)
-        assert len(transport.sent) == packets_before_cancellation
-
+        packets_after_cancellation = len(transport.sent)
         transport.packet_sent.clear()
         ping = asyncio.create_task(client.ping(timeout=0.2))
         await transport.packet_sent.wait()
         transport.feed(encode(PingResp(), version="5.0"))
         rtt = await ping
 
-    assert rtt >= 0
+        assert packets_after_cancellation == packets_before_cancellation
+        assert rtt >= 0
 
 
-async def test_stop_preserves_unsuback_error_when_observer_resubscribe_fails() -> None:
-    """A failed observer replacement must preserve errors and filter ownership."""
+async def test_cancellation_leaves_no_registered_filter() -> None:
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    entered = asyncio.Event()
+    blocker = asyncio.Event()
+    async with client:
+        task = await start_consumer(hold_subscription(client, "topic", entered, blocker), transport, entered)
+        protocol = client._protocol
+        assert protocol is not None
 
-    packet_id = 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+
+        assert not protocol._state.subscriptions.contains("topic")
+
+
+async def test_stop_reports_unsuback_rejection_and_keeps_observed_filter() -> None:
+    """Cleanup surfaces one error; an observed filter keeps its broker subscription."""
+
     allowed_filter = "allowed"
     denied_filter = "denied"
     reply_filter = "reply"
-    transport = FakeTransport(
-        feed=encode(ConnAck(session_present=False, return_code=0), version="5.0"),
-    )
-
-    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
-        return transport
-
-    client = MQTTClient("localhost", version="5.0", transport_factory=factory)
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
     subscription = client.subscribe(allowed_filter, denied_filter, reply_filter)
-
     async with client:
-        transport.packet_sent.clear()
-        started = asyncio.create_task(subscription.start())
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x00, 0x00, 0x00)), version="5.0"))
-        await started
+        await start_subscription(subscription, transport, return_codes=(0x00, 0x00, 0x00))
         protocol = client._protocol
         assert protocol is not None
+        index = protocol._state.subscriptions
         await protocol.add_response_observer(reply_filter)
-
         transport.packet_sent.clear()
         stopped = asyncio.create_task(subscription.stop())
         await transport.packet_sent.wait()
-        transport.feed(encode(UnsubAck(packet_id=packet_id, reason_codes=(0x00, 0x87)), version="5.0"))
-        transport.packet_sent.clear()
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x87,)), version="5.0"))
-        with pytest.raises(ExceptionGroup) as exc_info:
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00, 0x87)), version="5.0"))
+        with pytest.raises(MQTTUnsubscribeError) as exc_info:
             await stopped
-
+        observed_registered = index.contains(reply_filter)
+        observed_consumed = index.has_consumer(reply_filter)
+        rejected_consumed = index.has_consumer(denied_filter)
+        accepted_registered = index.contains(allowed_filter)
+        packets_after_unsubscribe = len(transport.sent)
         replacement = client.subscribe(allowed_filter)
+        await start_subscription(replacement, transport)
+        replacement_packets = len(transport.sent) - packets_after_unsubscribe
         transport.packet_sent.clear()
-        replacement_started = asyncio.create_task(replacement.start())
-        await transport.packet_sent.wait()
-        transport.feed(encode(SubAck(packet_id=packet_id, return_codes=(0x00,)), version="5.0"))
-        await replacement_started
 
-        transport.packet_sent.clear()
         retried = asyncio.create_task(subscription.stop())
         await transport.packet_sent.wait()
-        transport.feed(encode(UnsubAck(packet_id=packet_id, reason_codes=(0x87,)), version="5.0"))
-        with pytest.raises(MQTTUnsubscribeError):
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x87,)), version="5.0"))
+        with pytest.raises(MQTTUnsubscribeError) as retry_exc_info:
             await retried
-
-        transport.feed(
-            encode(
-                Publish(
-                    topic=allowed_filter,
-                    payload=b"replacement-still-active",
-                    qos=QoS.AT_MOST_ONCE,
-                    retain=False,
-                    dup=False,
-                ),
-                version="5.0",
-            ),
-        )
+        transport.feed(publish_v5(allowed_filter, b"replacement-still-active"))
         replacement_message = await asyncio.wait_for(replacement.get_message(), timeout=0.2)
 
-    errors = exc_info.value.exceptions
-    assert any(isinstance(error, MQTTUnsubscribeError) for error in errors)
-    assert any(isinstance(error, MQTTSubscribeError) for error in errors)
-    assert replacement_message.topic == allowed_filter
-    assert replacement_message.payload == b"replacement-still-active"
+        assert exc_info.value.failures == {denied_filter: 0x87}
+        assert subscription._registered_filters == [denied_filter]
+        assert observed_registered
+        assert not observed_consumed
+        assert rejected_consumed
+        assert not accepted_registered
+        assert replacement_packets == 1  # replacement SUBSCRIBE only
+        assert retry_exc_info.value.failures == {denied_filter: 0x87}
+        assert replacement_message.payload == b"replacement-still-active"
+
+
+async def test_stop_completes_when_messages_precede_unsuback_for_observed_filter() -> None:
+    """A filter kept for a pending request must not stall a following UNSUBACK."""
+
+    owned_filter = "allowed"
+    reply_filter = "reply"
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe(owned_filter, reply_filter, receive_buffer_size=1)
+    async with client:
+        await start_subscription(subscription, transport, return_codes=(0x00, 0x00))
+        protocol = client._protocol
+        assert protocol is not None
+        await protocol.add_response_observer(reply_filter)
+        transport.packet_sent.clear()
+
+        stopped = asyncio.create_task(subscription.stop())
+        await transport.packet_sent.wait()
+        transport.feed(publish_v5(reply_filter, b"first"))
+        transport.feed(publish_v5(reply_filter, b"second"))
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00,)), version="5.0"))
+        await asyncio.wait_for(stopped, timeout=0.2)
+
+        assert subscription not in client._subscriptions
+
+
+async def test_stop_sends_no_packet_for_an_observed_filter() -> None:
+    """An observed filter is released locally, so its verdict needs no round-trip."""
+
+    reply_filter = "reply"
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe(reply_filter)
+    async with client:
+        await start_subscription(subscription, transport)
+        protocol = client._protocol
+        assert protocol is not None
+        await protocol.add_response_observer(reply_filter)
+        packets_before_stop = len(transport.sent)
+
+        await asyncio.wait_for(subscription.stop(), timeout=0.2)
+
+        assert len(transport.sent) == packets_before_stop
+        assert protocol._state.subscriptions.contains(reply_filter)
+        assert not protocol._state.subscriptions.has_consumer(reply_filter)
+        assert subscription not in client._subscriptions
+
+
+async def test_stop_after_unexpected_drop_detaches_subscription() -> None:
+    """Stopping between connections completes locally instead of raising."""
+
+    transport = BreakableTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe("topic")
+    await client.connect()
+    await start_subscription(subscription, transport)
+    transport.broken = True
+    await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(subscription.stop(), timeout=1.0)
+
+    assert subscription not in client._subscriptions
+    assert subscription._registered_filters == []
+
+
+async def test_cancelled_stop_restores_blocking_delivery() -> None:
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe("topic", receive_buffer_size=1)
+    async with client:
+        await start_subscription(subscription, transport)
+        protocol = client._protocol
+        assert protocol is not None
+        transport.packet_sent.clear()
+
+        stopped = asyncio.create_task(subscription.stop())
+        await transport.packet_sent.wait()
+        stopped.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopped
+        transport.feed(publish_v5("topic", b"first"))
+        transport.feed(publish_v5("topic", b"second"))
+        first = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
+        second = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
+        entry = protocol._state.subscriptions.get("topic")
+
+        assert entry is not None
+        assert entry.state is EntryState.OWNED
+        assert [first.payload, second.payload] == [b"first", b"second"]
+
+
+async def test_refused_response_observer_release_keeps_the_filter() -> None:
+    reply_filter = "reply"
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe(reply_filter)
+    async with client:
+        await start_subscription(subscription, transport)
+        protocol = client._protocol
+        assert protocol is not None
+        await protocol.add_response_observer(reply_filter)
+        await subscription.stop()
+        transport.packet_sent.clear()
+
+        released = asyncio.create_task(protocol.remove_response_observer(reply_filter))
+        await transport.packet_sent.wait()
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x87,)), version="5.0"))
+        await released
+
+        assert protocol._state.subscriptions.contains(reply_filter)
+
+
+async def test_body_error_and_unexpected_cleanup_failure_are_combined() -> None:
+    """Any cleanup failure is combined with the body error, not just a rejected UNSUBACK."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    body_error = RuntimeError("application failed")
+    async with client:
+        transport.packet_sent.clear()
+        task = asyncio.create_task(fail_inside_subscription(client, "topic", body_error))
+        await transport.packet_sent.wait()
+        transport.feed(encode(SubAck(packet_id=1, return_codes=(0x00,)), version="5.0"))
+        transport.packet_sent.clear()
+        await transport.packet_sent.wait()
+
+        # A reason-code count that does not match the request reaches cleanup as
+        # something other than MQTTUnsubscribeError.
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00, 0x00)), version="5.0"))
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await asyncio.wait_for(task, timeout=0.2)
+
+        errors = exc_info.value.exceptions
+        assert errors[0] is body_error
+        assert isinstance(errors[1], MQTTProtocolError)

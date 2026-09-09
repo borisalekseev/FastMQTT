@@ -11,7 +11,7 @@ from zmqtt._internal.packets.codec import AnyPacket
 from zmqtt._internal.packets.publish import PubAck, PubComp, Publish, PubRec, PubRel
 from zmqtt._internal.routing import InboundRecipient, RequestRouter
 from zmqtt._internal.state import InboundQoS2Flight, InboundQoS2State, SessionState
-from zmqtt._internal.subscription_index import SubscriptionSelection
+from zmqtt._internal.subscription_index import SubscriptionEntry, SubscriptionSelection
 from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
 from zmqtt.errors import MQTTProtocolError
@@ -216,7 +216,8 @@ class _PersistentReplayBuffered:
                     if recipient.request is None and subscription is None:
                         unmatched.append(publish)
                         continue
-                    if subscription is not None and subscription[1].queue.full():
+                    queue = subscription[1].queue if subscription is not None else None
+                    if queue is not None and queue.full():
                         unmatched.append(publish)
                         continue
                     try:
@@ -492,11 +493,56 @@ class InboundPublishFlow:
             return
 
         filter_, entry = subscription
+        queue = entry.queue
+        if queue is None:
+            log.warning("Dropped message for topic %r: filter %r has no consumer", recipient.message.topic, filter_)
+            return
+
         message = recipient.message
         if not entry.auto_ack and ack_callback is not None:
             message._ack_callback = ack_callback  # noqa: SLF001 - internal delivery contract
-        await entry.queue.put(message)
+
+        try:
+            queue.put_nowait(message)
+        except asyncio.QueueFull:
+            if not await self._put_when_room(entry, queue, message, filter_):
+                return
         log.debug("Delivered message for topic %r to filter %r", message.topic, filter_)
+
+    async def _put_when_room(
+        self,
+        entry: SubscriptionEntry,
+        queue: "asyncio.Queue[Message]",
+        message: Message,
+        filter_: str,
+    ) -> bool:
+        """Wait for buffer space, abandoning the message if the owner detaches.
+
+        Blocking is the backpressure contract, but it must not outlive the consumer:
+        with nothing draining the queue this put would hold the read loop forever.
+        """
+        put = asyncio.ensure_future(queue.put(message))
+        detached = asyncio.ensure_future(entry.detached.wait())
+        try:
+            done, _ = await asyncio.wait({put, detached}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            put.cancel()
+            detached.cancel()
+            raise
+        detached.cancel()
+        if put in done:
+            put.result()
+            return True
+
+        put.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await put
+        log.warning(
+            "Dropped message for topic %r: filter %r detached while its buffer was full",
+            message.topic,
+            filter_,
+        )
+        return False
 
     @staticmethod
     def _make_message(publish: Publish) -> Message:

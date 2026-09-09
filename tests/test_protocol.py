@@ -41,6 +41,12 @@ from zmqtt.errors import (
 PUBLISH_FAILURE_CODES = [code for code in _PUBLISH_REASON_NAMES if code >= 0x80]
 
 
+def _queue_of(entry: SubscriptionEntry) -> "asyncio.Queue[Message]":
+    """A live entry always has a queue; a detached one is not what these tests observe."""
+    assert entry.queue is not None
+    return entry.queue
+
+
 class FakeTransport:
     """In-memory transport: read() drains from rx_queue; write() appends to sent."""
 
@@ -217,7 +223,7 @@ async def test_stripped_prefix_filter_receives_messages() -> None:
         ),
     )
 
-    assert entry.queue.qsize() == 1
+    assert _queue_of(entry).qsize() == 1
 
 
 def test_shared_prefixes_are_stripped_for_matching() -> None:
@@ -296,10 +302,10 @@ async def test_subscription_identifier_routes_delivery() -> None:
                 properties=PublishProperties(subscription_identifier=echoed),
             ),
         )
-        assert entry.queue.qsize() == 1
+        assert _queue_of(entry).qsize() == 1
 
-    assert shared.queue.qsize() == 1
-    assert plain.queue.qsize() == 1
+    assert _queue_of(shared).qsize() == 1
+    assert _queue_of(plain).qsize() == 1
 
 
 async def test_unknown_subscription_identifier_falls_back_to_topic_match(
@@ -321,7 +327,7 @@ async def test_unknown_subscription_identifier_falls_back_to_topic_match(
             ),
         )
 
-    assert entry.queue.qsize() == 1
+    assert _queue_of(entry).qsize() == 1
     assert "identifier 999" in caplog.text
 
 
@@ -354,8 +360,8 @@ async def test_matching_response_bypasses_regular_subscription() -> None:
     await protocol._handle_publish(response(b"unmatched", b"unknown"))
 
     assert [message.payload for message in observed] == [b"matched"]
-    assert (await regular.queue.get()).payload == b"unmatched"
-    assert regular.queue.empty()
+    assert (await _queue_of(regular).get()).payload == b"unmatched"
+    assert _queue_of(regular).empty()
 
 
 def test_recipient_selects_auto_ack_policy() -> None:
@@ -426,7 +432,7 @@ async def test_multi_filter_subscription_delivers_once_per_publish() -> None:
             properties=PublishProperties(subscription_identifier=1),
         ),
     )
-    sizes = {f: e.queue.qsize() for f, e in entries.items()}
+    sizes = {f: _queue_of(e).qsize() for f, e in entries.items()}
     assert sum(sizes.values()) == 1  # once per subscription, not once per filter
     assert sizes["demo/+/server/state/ack"] == 1  # and via the filter that matched
 

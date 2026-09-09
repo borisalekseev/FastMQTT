@@ -8,7 +8,6 @@ from collections.abc import AsyncGenerator, Iterable
 from typing import Final, Literal
 
 from zmqtt._internal import topic_matching
-from zmqtt._internal._compat import ExceptionGroup
 from zmqtt._internal.inbound import InboundPublishFlow
 from zmqtt._internal.packets.auth import Auth
 from zmqtt._internal.packets.codec import AnyPacket, encode
@@ -281,6 +280,10 @@ class MQTTProtocol:
         self._ping_waiters.clear()
         self.inbound.clear()
 
+    @property
+    def is_alive(self) -> bool:
+        return not self._dead
+
     def _ensure_alive(self) -> None:
         """Refuse new operations once the run loop has exited.
 
@@ -380,7 +383,7 @@ class MQTTProtocol:
 
         for req in filters:
             f = req.topic_filter
-            if self._state.subscriptions.contains(f):
+            if self._state.subscriptions.has_consumer(f):
                 log.warning("Filter %r already subscribed (ignored)", f)
             else:
                 new_entries[f] = SubscriptionEntry(
@@ -395,7 +398,7 @@ class MQTTProtocol:
         try:
             suback = await self._send_subscribe(filters, subscription_identifier)
             subscribed = True
-            return suback, {f: entry.queue for f, entry in new_entries.items()}
+            return suback, dict.fromkeys(new_entries, queue)
         finally:
             if not subscribed:
                 for f in new_entries:
@@ -412,63 +415,54 @@ class MQTTProtocol:
 
     async def _unsubscribe(self, filters: list[str]) -> UnsubAck | None:
         self._ensure_alive()
+
+        # An observed filter keeps its broker subscription, so its verdict needs no round-trip.
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
+        for filter_ in observed_filters:
+            self._state.subscriptions.release(filter_)
+
         broker_filters = [f for f in filters if f not in observed_filters]
+        if not broker_filters:
+            return None
 
-        removed_broker_entries = {
-            filter_: entry
-            for filter_ in broker_filters
-            if (entry := self._state.subscriptions.get(filter_)) is not None
-        }
-        for filter_ in removed_broker_entries:
-            self._state.subscriptions.remove(filter_)
+        # Stay registered until the broker answers: a refusal must not lose messages.
+        for filter_ in broker_filters:
+            self._state.subscriptions.start_draining(filter_)
 
+        settled = False
         try:
-            unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
-        except BaseException:
-            self._state.subscriptions.add_many(removed_broker_entries)
-            raise
-        unsubscribe_error = _unsubscribe_error(broker_filters, unsuback) if unsuback is not None else None
+            unsuback = await self._send_unsubscribe(broker_filters)
+            settled = True
+        finally:
+            # No verdict: the owner still holds these filters, so restore blocking delivery.
+            if not settled:
+                for filter_ in broker_filters:
+                    self._state.subscriptions.stop_draining(filter_)
 
+        unsubscribe_error = _unsubscribe_error(broker_filters, unsuback)
         if unsubscribe_error is None:
-            successful_broker_filters = broker_filters
-        else:
-            successful_broker_filters = [
-                filter_
-                for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True)
-                if reason_code in _UNSUBACK_SUCCESS_CODES
-            ]
-            rejected_broker_filters = [
-                filter_
-                for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True)
-                if reason_code not in _UNSUBACK_SUCCESS_CODES
-            ]
-            self._state.subscriptions.add_many(
-                {
-                    filter_: removed_broker_entries[filter_]
-                    for filter_ in rejected_broker_filters
-                    if filter_ in removed_broker_entries
-                },
-            )
+            for filter_ in broker_filters:
+                self._state.subscriptions.remove(filter_)
+            return unsuback
 
-        for filter_ in [*observed_filters, *successful_broker_filters]:
-            self._state.subscriptions.remove(filter_)
-        if observed_filters:
-            requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
-            try:
-                await self._send_subscribe(requests, subscription_identifier=None)
-            except Exception as observer_error:
-                if unsubscribe_error is not None:
-                    msg = "subscription cleanup failed"
-                    raise ExceptionGroup(
-                        msg,
-                        [unsubscribe_error, observer_error],
-                    ) from None
-                raise
+        for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True):
+            if reason_code in _UNSUBACK_SUCCESS_CODES:
+                self._state.subscriptions.remove(filter_)
+            else:
+                self._state.subscriptions.stop_draining(filter_)
+        raise unsubscribe_error
 
-        if unsubscribe_error is not None:
-            raise unsubscribe_error
-        return unsuback
+    def release_filters(self, filters: list[str]) -> None:
+        """Give up ownership without asking the broker.
+
+        Synchronous by necessity: this runs on the cancellation path, where any
+        await would be interrupted before the queues were released.
+        """
+        for filter_ in filters:
+            if self._state.subscriptions.has_response_observer(filter_):
+                self._state.subscriptions.release(filter_)
+            else:
+                self._state.subscriptions.remove(filter_)
 
     async def add_response_observer(self, topic: str) -> None:
         """Keep an exact response topic subscribed for pending requests."""
@@ -498,9 +492,13 @@ class MQTTProtocol:
     async def _remove_response_observer(self, topic: str) -> None:
         if not self._state.subscriptions.remove_response_observer(topic):
             return
-        if self._state.subscriptions.contains(topic) or self._dead:
+        if self._state.subscriptions.has_consumer(topic) or self._dead:
             return
-        await self._send_unsubscribe([topic])
+        unsuback = await self._send_unsubscribe([topic])
+        if _unsubscribe_error([topic], unsuback) is not None:
+            log.warning("Broker refused to release observed topic %r", topic)
+            return
+        self._state.subscriptions.remove(topic)
 
     async def _send_subscribe(
         self,

@@ -44,6 +44,26 @@ An unbounded queue does not drop or log excess messages; it keeps allocating
 memory. If dropping is part of your overload policy, implement that policy
 explicitly in application code.
 
+## When a message is dropped
+
+Blocking on a full queue assumes someone will drain it. Between `stop()`
+sending UNSUBSCRIBE and the broker answering, that assumption no longer holds:
+the consumer has left, so a blocked delivery would hold the read loop — and
+every other subscription on the connection — indefinitely.
+
+In that window, and only when the buffer is completely full, an arriving
+message is dropped and logged at `WARNING`. Messages already buffered are kept
+and can still be read after `stop()` returns. If the broker rejects the
+unsubscribe, the subscription stays active and delivery goes back to blocking.
+
+A message is also dropped, again at `WARNING`, when it arrives for a filter
+whose consumer is already gone — a subscription cancelled mid-flight, or a
+QoS 2 exchange whose PUBREL lands after `stop()`.
+
+A dropped message at QoS 1 or 2 is still acknowledged, so the broker will not
+redeliver it. Draining the subscription before calling `stop()` avoids the
+window entirely.
+
 ## Request / response
 
 MQTT 5.0 request routing has a separate limit. `max_pending_requests` defaults
