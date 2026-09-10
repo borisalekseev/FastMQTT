@@ -94,7 +94,7 @@ async for msg in sub:
 |-------|------|-------------|
 | `payload_format_indicator` | `int \| None` | 0 = bytes, 1 = UTF-8 string |
 | `message_expiry_interval` | `int \| None` | Seconds until broker discards |
-| `topic_alias` | `int \| None` | Topic alias integer |
+| `topic_alias` | `int \| None` | Integer 1..65535, limited by the server's Topic Alias Maximum |
 | `response_topic` | `str \| None` | Topic for response messages |
 | `correlation_data` | `bytes \| None` | Request/response correlation token |
 | `subscription_identifier` | `int \| None` | Set by broker, not by publisher |
