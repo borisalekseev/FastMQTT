@@ -26,6 +26,7 @@ from zmqtt.errors import (
     MQTTInvalidTopicError,
     MQTTProtocolError,
     MQTTPublishError,
+    MQTTQoSExceededError,
     MQTTSubscribeError,
     MQTTTimeoutError,
 )
@@ -44,6 +45,7 @@ __all__ = (
     "MQTTInvalidTopicError",
     "MQTTProtocolError",
     "MQTTPublishError",
+    "MQTTQoSExceededError",
     "MQTTSubscribeError",
     "MQTTTimeoutError",
     "Message",
