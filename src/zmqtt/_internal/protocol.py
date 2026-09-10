@@ -31,7 +31,7 @@ from zmqtt._internal.state import (
     QoS1Flight,
     SessionState,
 )
-from zmqtt._internal.subscription_index import SubscriptionEntry
+from zmqtt._internal.subscription_index import SubscriptionClaim, SubscriptionEntry
 from zmqtt._internal.transport.base import Transport
 from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
@@ -294,6 +294,14 @@ class MQTTProtocol:
     def is_alive(self) -> bool:
         return not self._dead
 
+    def claim_of(self, queue: "asyncio.Queue[Message]") -> SubscriptionClaim:
+        """Which filters ``queue`` holds on this connection, and whether it has left."""
+        owned = self._state.subscriptions.owned_by(queue)
+        return SubscriptionClaim(
+            filters=tuple(f for f, _ in owned),
+            departed=any(self._state.subscriptions.is_departed(f) for f, _ in owned),
+        )
+
     def _ensure_alive(self) -> None:
         """Refuse new operations once the run loop has exited.
 
@@ -358,8 +366,8 @@ class MQTTProtocol:
         queue: asyncio.Queue[Message],
         auto_ack: bool = True,
         subscription_identifier: int | None = None,
-    ) -> tuple[SubAck, dict[str, asyncio.Queue[Message]]]:
-        """Send SUBSCRIBE and return (SubAck, {filter: queue}) after broker ACK.
+    ) -> SubAck:
+        """Send SUBSCRIBE and return the SubAck once the broker has acknowledged.
 
         Queues are registered before SUBSCRIBE is sent so no messages are lost.
         Duplicate filters (already subscribed) are logged as warnings and skipped;
@@ -391,13 +399,13 @@ class MQTTProtocol:
         auto_ack: bool,
         queue: asyncio.Queue[Message],
         subscription_identifier: int | None,
-    ) -> tuple[SubAck, dict[str, asyncio.Queue[Message]]]:
+    ) -> SubAck:
         new_entries: dict[str, SubscriptionEntry] = {}
 
         for req in filters:
             f = req.topic_filter
-            if self._state.subscriptions.has_consumer(f):
-                if self._state.subscriptions.is_departing(f):
+            if self._state.subscriptions.contains(f):
+                if self._state.subscriptions.is_departed(f):
                     msg = (
                         f"Filter {f!r} is still held by a subscription whose unsubscribe "
                         f"the broker refused; retry that subscription's stop() first"
@@ -417,7 +425,7 @@ class MQTTProtocol:
         try:
             suback = await self._send_subscribe(filters, subscription_identifier)
             subscribed = True
-            return suback, dict.fromkeys(new_entries, queue)
+            return suback
         finally:
             if not subscribed:
                 for f in new_entries:
@@ -438,7 +446,7 @@ class MQTTProtocol:
         # An observed filter keeps its broker subscription, so its verdict needs no round-trip.
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
         for filter_ in observed_filters:
-            self._state.subscriptions.release(filter_)
+            self._state.subscriptions.remove(filter_)
 
         broker_filters = [f for f in filters if f not in observed_filters]
         if not broker_filters:
@@ -446,7 +454,7 @@ class MQTTProtocol:
 
         # Stay registered until the broker answers: a refusal must not lose messages.
         for filter_ in broker_filters:
-            self._state.subscriptions.start_draining(filter_)
+            self._state.subscriptions.mark_departed(filter_)
 
         unsuback = await self._send_unsubscribe(broker_filters)
 
@@ -463,14 +471,14 @@ class MQTTProtocol:
                 self._state.subscriptions.remove(filter_)
         raise unsubscribe_error
 
-    def mark_departing(self, filters: list[str]) -> None:
-        """Re-register filters for an owner that already asked to leave.
+    def mark_departed(self, filters: list[str]) -> None:
+        """Carry "the owner has left" across a reconnect.
 
-        A reconnect rebuilds every entry as owned, which would make a buffer
+        A reconnect rebuilds every entry as consuming, which would let a buffer
         nobody drains block the read loop for the whole connection again.
         """
         for filter_ in filters:
-            self._state.subscriptions.start_draining(filter_)
+            self._state.subscriptions.mark_departed(filter_)
 
     def release_filters(self, filters: list[str]) -> None:
         """Give up ownership without asking the broker.
@@ -479,10 +487,7 @@ class MQTTProtocol:
         await would be interrupted before the queues were released.
         """
         for filter_ in filters:
-            if self._state.subscriptions.has_response_observer(filter_):
-                self._state.subscriptions.release(filter_)
-            else:
-                self._state.subscriptions.remove(filter_)
+            self._state.subscriptions.remove(filter_)
 
     async def add_response_observer(self, topic: str) -> None:
         """Keep an exact response topic subscribed for pending requests."""
@@ -512,7 +517,7 @@ class MQTTProtocol:
     async def _remove_response_observer(self, topic: str) -> None:
         if not self._state.subscriptions.remove_response_observer(topic):
             return
-        if self._state.subscriptions.has_consumer(topic) or self._dead:
+        if self._state.subscriptions.contains(topic) or self._dead:
             return
         unsuback = await self._send_unsubscribe([topic])
         if _unsubscribe_error([topic], unsuback) is not None:

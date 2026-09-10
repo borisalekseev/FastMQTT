@@ -58,11 +58,12 @@ room, and once it is completely full an arriving message is dropped and logged
 at `WARNING`. A successful UNSUBACK ends delivery altogether. Either way,
 whatever is already buffered stays readable.
 
-Not blocking is permanent for the connection, which matters after a rejection:
-the filter keeps delivering but never applies backpressure again, so a burst
-that outruns your reading loses messages even while you are reading. Size
-`receive_buffer_size` for that burst, or retry `stop()` until the broker accepts
-it. Only a reconnect restores blocking delivery.
+Not blocking is permanent, which matters after a rejection: the filter keeps
+delivering but never applies backpressure again, so a burst that outruns your
+reading loses messages even while you are reading. A reconnect does not undo
+this — the filter is resubscribed in the same non-blocking state, because the
+consumer that asked to leave is still gone. Size `receive_buffer_size` for that
+burst, or retry `stop()` until the broker accepts it.
 
 Messages are also dropped for a subscription that was cancelled, or whose
 `stop()` was cancelled: cancelling gives the subscription up.

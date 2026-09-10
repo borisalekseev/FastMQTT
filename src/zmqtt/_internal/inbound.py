@@ -333,6 +333,8 @@ class InboundPublishFlow:
             raise MQTTProtocolError(msg)
         await self._connection.send_packet(PubComp(packet_id=packet.packet_id))
         if not flight.delivered:
+            # Result deliberately ignored: committed at PUBREC, so a message
+            # dropped here is already unrecoverable (docs/advanced/backpressure.md).
             await self._deliver(flight.recipient, ack_callback=None)
 
     def select_recipient(self, publish: Publish) -> InboundRecipient:
@@ -485,8 +487,10 @@ class InboundPublishFlow:
     ) -> bool:
         """Deliver the message, returning ``False`` only if it was abandoned.
 
-        An abandoned message must not be acknowledged, or the broker drops it
-        from the session and no redelivery can recover it.
+        Callers that acknowledge after delivery (QoS 1) must withhold the
+        acknowledgement on ``False``, or the broker drops the message from the
+        session and no redelivery can recover it. QoS 2 commits at PUBREC,
+        before delivery, so it has nothing left to withhold.
         """
         if recipient.request is not None:
             recipient.request.deliver()
@@ -517,20 +521,20 @@ class InboundPublishFlow:
         message: Message,
         filter_: str,
     ) -> bool:
-        """Wait for buffer space, abandoning the message if the owner detaches.
+        """Wait for buffer space, abandoning the message if the owner departs.
 
         Blocking is the backpressure contract, but it must not outlive the consumer:
         with nothing draining the queue this put would hold the read loop forever.
         """
         put = asyncio.ensure_future(queue.put(message))
-        detached = asyncio.ensure_future(entry.detached.wait())
+        departed = asyncio.ensure_future(entry.departed.wait())
         try:
-            done, _ = await asyncio.wait({put, detached}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait({put, departed}, return_when=asyncio.FIRST_COMPLETED)
         except BaseException:
             put.cancel()
-            detached.cancel()
+            departed.cancel()
             raise
-        detached.cancel()
+        departed.cancel()
         if put in done:
             put.result()
             return True
@@ -539,7 +543,7 @@ class InboundPublishFlow:
         with contextlib.suppress(asyncio.CancelledError):
             await put
         log.warning(
-            "Dropped message for topic %r: filter %r detached while its buffer was full",
+            "Dropped message for topic %r: filter %r departed while its buffer was full",
             message.topic,
             filter_,
         )

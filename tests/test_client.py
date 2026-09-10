@@ -112,6 +112,24 @@ def v5_client(transport: FakeTransport) -> MQTTClient:
     return MQTTClient("localhost", version="5.0", transport_factory=factory)
 
 
+def reconnecting_v5_client(*transports: FakeTransport) -> MQTTClient:
+    """MQTT 5.0 client handing out ``transports`` in order as it reconnects."""
+    handed = 0
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        nonlocal handed
+        transport = transports[min(handed, len(transports) - 1)]
+        handed += 1
+        return transport
+
+    return MQTTClient(
+        "localhost",
+        version="5.0",
+        transport_factory=factory,
+        reconnect=ReconnectConfig(enabled=True, initial_delay=0.01),
+    )
+
+
 async def start_subscription(
     subscription: Subscription,
     transport: FakeTransport,
@@ -274,7 +292,6 @@ async def test_mqtt_connect_timeout_gives_up_after_max_attempts() -> None:
 
 async def test_stop_completes_when_messages_precede_unsuback() -> None:
     """A full subscription queue must not block a following UNSUBACK."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic", receive_buffer_size=1)
@@ -294,7 +311,6 @@ async def test_stop_completes_when_messages_precede_unsuback() -> None:
 
 async def test_full_subscription_queue_delivers_messages_after_consumer_makes_room() -> None:
     """A bounded queue applies backpressure instead of dropping a QoS 1 message."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic", auto_ack=False, receive_buffer_size=1)
@@ -313,7 +329,6 @@ async def test_full_subscription_queue_delivers_messages_after_consumer_makes_ro
 
 async def test_cancelled_consumer_detaches_without_waiting_for_the_broker() -> None:
     """A cancelled consumer releases its filter locally, asking the broker nothing."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     entered = asyncio.Event()
@@ -341,7 +356,6 @@ async def test_cancelled_consumer_detaches_without_waiting_for_the_broker() -> N
 
 async def test_failed_start_leaves_no_registration_behind() -> None:
     """A subscription is claimed once or not at all: a second claim survives its own stop()."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic")
@@ -362,7 +376,6 @@ async def test_failed_start_leaves_no_registration_behind() -> None:
 
 async def test_rejected_unsubscribe_preserves_broker_diagnostics() -> None:
     """The broker's Reason String and User Properties both reach the caller."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("denied")
@@ -388,22 +401,9 @@ async def test_rejected_unsubscribe_preserves_broker_diagnostics() -> None:
 
 async def test_reconnect_keeps_a_departed_subscription_non_blocking() -> None:
     """A refused stop() leaves nobody reading; a reconnect must not make it blocking again."""
-
     first = BreakableTransport(feed=CONNACK_V5)
     second = BreakableTransport(feed=CONNACK_V5)
-    made: list[BreakableTransport] = []
-
-    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
-        made.append(first if not made else second)
-        return made[-1]
-
-    client = MQTTClient(
-        "localhost",
-        version="5.0",
-        transport_factory=factory,
-        reconnect=ReconnectConfig(enabled=True, initial_delay=0.01),
-    )
-    async with client:
+    async with reconnecting_v5_client(first, second) as client:
         other = client.subscribe("other")
         await start_subscription(other, first)
         departed = client.subscribe("denied", receive_buffer_size=1)
@@ -427,7 +427,6 @@ async def test_reconnect_keeps_a_departed_subscription_non_blocking() -> None:
 
 async def test_resubscribing_a_refused_filter_is_refused() -> None:
     """A filter its owner failed to release must not hand back a silent, dead subscription."""
-
     denied_filter = "denied"
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
@@ -450,7 +449,6 @@ async def test_resubscribing_a_refused_filter_is_refused() -> None:
 
 async def test_stop_sends_no_packet_for_an_observed_filter() -> None:
     """An observed filter is released locally, so its verdict needs no round-trip."""
-
     reply_filter = "reply"
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
@@ -464,15 +462,13 @@ async def test_stop_sends_no_packet_for_an_observed_filter() -> None:
 
         await asyncio.wait_for(subscription.stop(), timeout=0.2)
 
-        assert len(transport.sent) == packets_before_stop
-        assert protocol._state.subscriptions.contains(reply_filter)
-        assert not protocol._state.subscriptions.has_consumer(reply_filter)
+        assert len(transport.sent) == packets_before_stop  # no UNSUBSCRIBE
         assert subscription not in client._subscriptions
+        assert protocol._state.subscriptions.has_response_observer(reply_filter)
 
 
 async def test_cancelled_stop_gives_up_the_subscription() -> None:
     """A cancelled stop() is a consumer that is done, not one that changed its mind."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic", receive_buffer_size=1)
@@ -496,7 +492,8 @@ async def test_cancelled_stop_gives_up_the_subscription() -> None:
             await asyncio.wait_for(subscription.get_message(), timeout=0.2)
 
 
-async def test_refused_response_observer_release_keeps_the_filter() -> None:
+async def test_a_refused_observer_release_leaves_the_connection_usable() -> None:
+    """Nothing can act on this refusal: the observer is dropped either way."""
     reply_filter = "reply"
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
@@ -513,13 +510,17 @@ async def test_refused_response_observer_release_keeps_the_filter() -> None:
         await transport.packet_sent.wait()
         transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x87,)), version="5.0"))
         await released
+        transport.packet_sent.clear()
+        ping = asyncio.create_task(client.ping(timeout=0.2))
+        await transport.packet_sent.wait()
+        transport.feed(encode(PingResp(), version="5.0"))
 
-        assert protocol._state.subscriptions.contains(reply_filter)
+        assert not protocol._state.subscriptions.has_response_observer(reply_filter)
+        assert await ping >= 0
 
 
 async def test_body_error_and_unexpected_cleanup_failure_are_combined() -> None:
     """Any cleanup failure is combined with the body error, not just a rejected UNSUBACK."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     body_error = RuntimeError("application failed")
@@ -544,7 +545,6 @@ async def test_body_error_and_unexpected_cleanup_failure_are_combined() -> None:
 
 async def test_dropped_message_is_not_acknowledged() -> None:
     """A QoS 1 message the client throws away must stay redeliverable."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic", receive_buffer_size=1)
@@ -566,7 +566,6 @@ async def test_dropped_message_is_not_acknowledged() -> None:
 
 async def test_message_without_a_subscriber_is_acknowledged() -> None:
     """A message no filter matches is undeliverable, not abandoned."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic")
@@ -581,7 +580,6 @@ async def test_message_without_a_subscriber_is_acknowledged() -> None:
 
 async def test_qos2_message_completed_after_stop_is_still_readable() -> None:
     """A QoS 2 exchange the client committed to at PUBREC belongs in the buffer."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic")
@@ -622,7 +620,6 @@ async def test_departed_consumer_does_not_stall_the_connection(
     expected_error: type[BaseException],
 ) -> None:
     """However stop() ends, the consumer is gone and must not starve the connection."""
-
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     abandoned = client.subscribe("abandoned", receive_buffer_size=1)

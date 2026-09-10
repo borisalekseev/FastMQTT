@@ -1,5 +1,4 @@
 import asyncio
-import enum
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -7,34 +6,13 @@ from zmqtt._internal.topic_matching import _segment_rank, _topic_matches
 from zmqtt._internal.types.message import Message
 
 
-class EntryState(enum.Enum):
-    """What, if anything, is consuming a filter the broker holds."""
-
-    OWNED = "owned"  # delivery blocks on a full queue, applying backpressure
-    DRAINING = "draining"  # UNSUBSCRIBE in flight: still routable, but delivery must never block
-    RELEASED = "released"  # no consumer; kept registered for a pending request
-
-
 @dataclass(slots=True, kw_only=True)
 class SubscriptionEntry:
     queue: asyncio.Queue[Message]
-    state: EntryState = EntryState.OWNED
-    detached: asyncio.Event = field(default_factory=asyncio.Event)
+    departed: asyncio.Event = field(default_factory=asyncio.Event)  # also wakes a delivery blocked on a full queue
     auto_ack: bool = True
     actual_filter: str = ""  # filter with broker-stripped subscription decorators removed
     subscription_identifier: int | None = None  # v5; echoed by the broker on PUBLISH
-
-    def transition(self, state: EntryState) -> None:
-        """Move to ``state``, keeping the detach signal in step.
-
-        Derived here rather than remembered by callers: left set on a consuming
-        entry, every delivery to a full queue is dropped instead of blocking.
-        """
-        self.state = state
-        if state is EntryState.OWNED:
-            self.detached.clear()
-        else:
-            self.detached.set()
 
 
 @dataclass(slots=True)
@@ -42,6 +20,18 @@ class _Node:
     children: dict[str, "_Node"] = field(default_factory=dict)
     wildcard_children: dict[str, "_Node"] = field(default_factory=dict)
     entries: list[tuple[str, SubscriptionEntry]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionClaim:
+    """What one subscription held at the instant it was read.
+
+    Derived from the index rather than mirrored on the Subscription, so it cannot
+    drift out of step with what the broker was actually told.
+    """
+
+    filters: tuple[str, ...] = ()
+    departed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,31 +70,30 @@ class SubscriptionIndex:
     def contains(self, filter_: str) -> bool:
         return filter_ in self._entries
 
-    def has_consumer(self, filter_: str) -> bool:
-        entry = self._entries.get(filter_)
-        return entry is not None and entry.state is not EntryState.RELEASED
+    def owned_by(self, queue: "asyncio.Queue[Message]") -> list[tuple[str, SubscriptionEntry]]:
+        """Entries fed by ``queue``, in subscribe order.
 
-    def is_departing(self, filter_: str) -> bool:
+        Each Subscription creates exactly one queue, so the queue identifies its
+        owner and no subscription needs to remember what it holds.
+        """
+        return [(f, e) for f, e in self._entries.items() if e.queue is queue]
+
+    def is_departed(self, filter_: str) -> bool:
         """The owner asked to leave and the broker has not released the filter yet."""
         entry = self._entries.get(filter_)
-        return entry is not None and entry.state is EntryState.DRAINING
+        return entry is not None and entry.departed.is_set()
 
-    def start_draining(self, filter_: str) -> bool:
-        """Await the broker's verdict: still registered and routable, but never blocking."""
+    def mark_departed(self, filter_: str) -> bool:
+        """Give up the consumer, leaving the filter registered and routable.
+
+        Delivery still fills the buffer but stops blocking on it: with nobody
+        draining, a blocked put would hold the read loop for every subscription.
+        """
         entry = self._entries.get(filter_)
-        if entry is None or entry.state is not EntryState.OWNED:
+        if entry is None or entry.departed.is_set():
             return False
 
-        entry.transition(EntryState.DRAINING)
-        return True
-
-    def release(self, filter_: str) -> bool:
-        """Give up the consumer while leaving the filter registered at the broker."""
-        entry = self._entries.get(filter_)
-        if entry is None or entry.state is EntryState.RELEASED:
-            return False
-
-        self._unlink(filter_, entry)
+        entry.departed.set()
         return True
 
     def add_response_observer(self, topic: str) -> bool:
@@ -138,7 +127,7 @@ class SubscriptionIndex:
         return entry
 
     def _unlink(self, filter_: str, entry: SubscriptionEntry) -> None:
-        entry.transition(EntryState.RELEASED)
+        entry.departed.set()
         tree_filter = entry.actual_filter or filter_
         self._remove_entry(tree_filter.split("/"), filter_, entry, self._root)
 

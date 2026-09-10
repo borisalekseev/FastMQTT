@@ -1,8 +1,11 @@
 """Unit tests for SubscriptionIndex entry lifecycle."""
 
 import asyncio
+from collections.abc import Callable
 
-from zmqtt._internal.subscription_index import EntryState, SubscriptionEntry, SubscriptionIndex
+import pytest
+
+from zmqtt._internal.subscription_index import SubscriptionEntry, SubscriptionIndex
 
 
 def _index() -> tuple[SubscriptionIndex, SubscriptionEntry]:
@@ -16,41 +19,48 @@ def _index() -> tuple[SubscriptionIndex, SubscriptionEntry]:
 def test_a_fresh_entry_blocks_on_a_full_queue() -> None:
     _, entry = _index()
 
-    assert not entry.detached.is_set()
+    assert not entry.departed.is_set()
 
 
-def test_draining_releases_a_suspended_delivery() -> None:
+@pytest.mark.parametrize("depart", [SubscriptionIndex.mark_departed, SubscriptionIndex.remove])
+def test_departing_releases_a_suspended_delivery(depart: Callable[[SubscriptionIndex, str], object]) -> None:
+    """Either way of giving up a consumer wakes a delivery blocked on its queue."""
     index, entry = _index()
 
-    index.start_draining("a")
+    depart(index, "a")
 
-    assert entry.state is EntryState.DRAINING
-    assert entry.detached.is_set()
+    assert entry.departed.is_set()
 
 
-def test_releasing_keeps_the_registration_but_drops_the_consumer() -> None:
-    index, entry = _index()
+def test_a_departed_entry_stays_registered_and_routable() -> None:
+    """A refused unsubscribe keeps delivering; it only stops applying backpressure."""
+    index, _ = _index()
 
-    index.release("a")
+    index.mark_departed("a")
 
     assert index.contains("a")
-    assert not index.has_consumer("a")
-    assert entry.state is EntryState.RELEASED
-    assert entry.detached.is_set()
+    assert index.is_departed("a")
+    assert index.match("a") != []
 
 
-def test_removing_releases_a_suspended_delivery() -> None:
-    index, entry = _index()
+def test_a_removed_entry_is_no_longer_routed() -> None:
+    index, _ = _index()
 
     index.remove("a")
 
     assert not index.contains("a")
-    assert entry.detached.is_set()
-
-
-def test_a_released_entry_is_no_longer_routed() -> None:
-    index, _ = _index()
-
-    index.release("a")
-
     assert index.match("a") == []
+
+
+def test_owned_by_identifies_entries_by_their_queue() -> None:
+    index = SubscriptionIndex()
+    mine: asyncio.Queue = asyncio.Queue()
+    theirs: asyncio.Queue = asyncio.Queue()
+    index.add("a", SubscriptionEntry(queue=mine))
+    index.add("b", SubscriptionEntry(queue=theirs))
+    index.add("c", SubscriptionEntry(queue=mine))
+
+    owned = index.owned_by(mine)
+
+    assert [f for f, _ in owned] == ["a", "c"]
+    assert [f for f, _ in index.owned_by(theirs)] == ["b"]

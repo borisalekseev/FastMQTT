@@ -25,6 +25,7 @@ from zmqtt._internal.packets.subscribe import SubscriptionRequest
 from zmqtt._internal.protocol import MQTTProtocol
 from zmqtt._internal.request_response import _RequestDispatcher
 from zmqtt._internal.state import SessionState
+from zmqtt._internal.subscription_index import SubscriptionClaim
 from zmqtt._internal.topic_matching import _DEFAULT_STRIPPED_PREFIXES
 from zmqtt._internal.transport.base import Transport
 from zmqtt._internal.transport.tcp import open_tcp
@@ -33,7 +34,7 @@ from zmqtt._internal.types.message import Message
 from zmqtt._internal.types.qos import QoS
 from zmqtt._internal.types.retain_handling import RetainHandling
 from zmqtt._internal.types.topic import validate_publish, validate_response_topic, validate_subscribe_topic
-from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError, MQTTUnsubscribeError
+from zmqtt.errors import MQTTConnectError, MQTTDisconnectedError, MQTTTimeoutError
 
 __all__ = (
     "ConnectionInfo",
@@ -258,8 +259,6 @@ class Subscription:
         self._retain_as_published = retain_as_published
         self._retain_handling = retain_handling
         self._subscription_identifier = subscription_identifier
-        self._registered_filters: list[str] = []
-        self._departed = False
 
     async def __aenter__(self) -> Self:
         """Register the subscription filters with the broker.
@@ -274,7 +273,6 @@ class Subscription:
             raise MQTTDisconnectedError(msg)
         # Registered before subscribing so a reconnect mid-SUBSCRIBE still restores it,
         # but a failed start must not leave a second, unstoppable claim behind.
-        self._departed = False
         attached = self in self._client._subscriptions
         if not attached:
             self._client._subscriptions.append(self)
@@ -310,9 +308,8 @@ class Subscription:
     def _abandon(self) -> None:
         """Detach locally without asking the broker, for a consumer already cancelled."""
         protocol = self._client._protocol
-        if protocol is not None and protocol.is_alive and self._registered_filters:
-            protocol.release_filters(self._registered_filters)
-        self._registered_filters = []
+        if protocol is not None and protocol.is_alive:
+            protocol.release_filters(list(protocol.claim_of(self._queue).filters))
         self._detach()
 
     def _handle_cleanup_failure(
@@ -331,35 +328,29 @@ class Subscription:
         log.warning("Subscription cleanup failed", exc_info=cleanup_error)
 
     async def _stop(self) -> None:
-        # From here on nothing is expected to drain this subscription, whatever
-        # the broker answers — a reconnect must not quietly make it blocking again.
-        self._departed = True
-        if not self._registered_filters:
-            self._detach()
-            return
         protocol = self._client._protocol
         if protocol is None or not protocol.is_alive:
-            self._registered_filters = []
+            self._detach()
+            return
+        filters = list(protocol.claim_of(self._queue).filters)
+        if not filters:
             self._detach()
             return
 
+        # A rejected UNSUBACK propagates with the subscription still attached, and
+        # needs no bookkeeping: the index already dropped whatever the broker
+        # released, so a retry sees only the refused filters.
         try:
-            await protocol.unsubscribe(self._registered_filters)
+            await protocol.unsubscribe(filters)
         except asyncio.CancelledError:
             # The caller stopped consuming, so nothing would drain these filters again.
             self._abandon()
             raise
-        except MQTTUnsubscribeError as error:
-            # A retry must target only what the broker still holds.
-            self._registered_filters = [filter_ for filter_ in self._registered_filters if filter_ in error.failures]
-            raise
         except MQTTDisconnectedError:
             # The session went away mid-flight, and its subscriptions with it.
-            self._registered_filters = []
             self._detach()
             return
 
-        self._registered_filters = []
         self._detach()
 
     def _detach(self) -> None:
@@ -370,7 +361,6 @@ class Subscription:
         filters = self._filters if filters is None else filters
         if not filters:
             # A SUBSCRIBE with no topic filter is a Protocol Error (MQTT 5 3.8.3).
-            self._registered_filters = []
             return
         reqs = [
             SubscriptionRequest(
@@ -382,19 +372,19 @@ class Subscription:
             )
             for f in filters
         ]
-        _, queues = await protocol.subscribe(
+        await protocol.subscribe(
             reqs,
             auto_ack=self._auto_ack,
             queue=self._queue,
             subscription_identifier=self._subscription_identifier,
         )
-        self._registered_filters = list(queues.keys())
 
-    async def _reconnect(self, protocol: MQTTProtocol) -> None:
-        """Re-subscribe on a fresh protocol after reconnection."""
-        await self._do_subscribe(protocol, self._registered_filters)
-        if self._departed:
-            protocol.mark_departing(self._registered_filters)
+    async def _reconnect(self, protocol: MQTTProtocol, claim: SubscriptionClaim) -> None:
+        """Restore on a fresh protocol what ``claim`` held on the old one."""
+        filters = list(claim.filters)
+        await self._do_subscribe(protocol, filters)
+        if claim.departed:
+            protocol.mark_departed(filters)
 
     async def start(self) -> None:
         """Register the subscription filters with the broker.
@@ -986,7 +976,7 @@ class MQTTClient:
                 return
 
     async def _run_loop(self) -> None:
-        subs_to_restore: list[Subscription] = []
+        subs_to_restore: list[tuple[Subscription, SubscriptionClaim]] = []
 
         while True:
             if self._protocol is None:
@@ -999,8 +989,8 @@ class MQTTClient:
                 # so this collapses to the original "await protocol.run()" pattern.
                 await self._protocol.started_event.wait()
                 if subs_to_restore:
-                    for sub in subs_to_restore:
-                        await sub._reconnect(self._protocol)
+                    for sub, claim in subs_to_restore:
+                        await sub._reconnect(self._protocol, claim)
                     subs_to_restore = []
                 await self._request_dispatcher.restore()
                 await protocol_run_task
@@ -1020,7 +1010,9 @@ class MQTTClient:
                 protocol_run_task.cancel()
                 await asyncio.gather(protocol_run_task, return_exceptions=True)
 
-            subs_to_restore = list(self._subscriptions)
+            # Read before reconnecting: the dying protocol's index is the only
+            # record of what each subscription held when the link dropped.
+            subs_to_restore = [(sub, self._protocol.claim_of(sub._queue)) for sub in self._subscriptions]
             log.warning("Connection lost, reconnecting...")
             try:
                 await self._connect_with_retry(wait_before_first_attempt=True)

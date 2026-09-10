@@ -130,8 +130,7 @@ class TestMosquittoV5(BaseTestMosquitto):
             await asyncio.wait_for(sub.get_message(), timeout=0.5)
 
     async def test_refused_unsubscribe_does_not_stall_the_connection(self, mqtt_client: MQTTClient) -> None:
-        """Walking away from a refused unsubscribe must not wedge the connection."""
-
+        """Nothing drains a refused filter, so its full buffer must never block the read loop."""
         suffix = uuid.uuid4().hex
         denied_filter = f"zmqtt/unsuback/denied/{suffix}"
         healthy_filter = f"zmqtt/healthy/{suffix}"
@@ -150,22 +149,19 @@ class TestMosquittoV5(BaseTestMosquitto):
         assert message.payload == b"still-alive"
 
     async def test_reconnect_restores_only_filter_rejected_by_unsuback(self, mqtt_client: MQTTClient) -> None:
-        """After reconnect, only the filter rejected by UNSUBACK receives messages."""
-
+        """A reconnect must not undo a successful UNSUBACK by resubscribing what it removed."""
         suffix = uuid.uuid4().hex
         allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
         denied_filter = f"zmqtt/unsuback/denied/{suffix}"
         sub = mqtt_client.subscribe(allowed_filter, denied_filter)
-
         await sub.start()
         with pytest.raises(MQTTUnsubscribeError) as exc_info:
             await sub.stop()
-
         await mqtt_client.publish(denied_filter, b"reconnect-ready", retain=True)
         await asyncio.wait_for(sub.get_message(), timeout=5.0)
+
         await self.force_tcp_disconnect(mqtt_client)
         reconnect_message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
-
         await mqtt_client.publish(allowed_filter, b"must-not-return")
         await mqtt_client.publish(denied_filter, b"still-subscribed-after-reconnect")
         message = await asyncio.wait_for(sub.get_message(), timeout=5.0)
@@ -177,7 +173,6 @@ class TestMosquittoV5(BaseTestMosquitto):
 
     async def test_context_exit_with_rejected_unsuback_keeps_delivering(self, mqtt_client: MQTTClient) -> None:
         """Leaving the context manager reports a refusal exactly as stop() does."""
-
         denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
         subscription = mqtt_client.subscribe(denied_filter)
 
@@ -192,7 +187,6 @@ class TestMosquittoV5(BaseTestMosquitto):
 
     async def test_retried_stop_leaves_replacement_subscription_active(self, mqtt_client: MQTTClient) -> None:
         """A retry targets only refused filters, never one a newer subscription took over."""
-
         suffix = uuid.uuid4().hex
         allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
         denied_filter = f"zmqtt/unsuback/denied/{suffix}"
