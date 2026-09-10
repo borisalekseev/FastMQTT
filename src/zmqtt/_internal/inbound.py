@@ -216,8 +216,7 @@ class _PersistentReplayBuffered:
                     if recipient.request is None and subscription is None:
                         unmatched.append(publish)
                         continue
-                    queue = subscription[1].queue if subscription is not None else None
-                    if queue is not None and queue.full():
+                    if subscription is not None and subscription[1].queue.full():
                         unmatched.append(publish)
                         continue
                     try:
@@ -416,8 +415,8 @@ class InboundPublishFlow:
             msg = "Cannot publish without packet id"
             raise ValueError(msg)
         if recipient.auto_ack:
-            await self._deliver(recipient, ack_callback=None)
-            await self._connection.send_packet(PubAck(packet_id=packet.packet_id))
+            if await self._deliver(recipient, ack_callback=None):
+                await self._connection.send_packet(PubAck(packet_id=packet.packet_id))
         else:
             acked = False
 
@@ -483,21 +482,22 @@ class InboundPublishFlow:
         self,
         recipient: InboundRecipient,
         ack_callback: Callable[[], Awaitable[None]] | None,
-    ) -> None:
+    ) -> bool:
+        """Deliver the message, returning ``False`` only if it was abandoned.
+
+        An abandoned message must not be acknowledged, or the broker drops it
+        from the session and no redelivery can recover it.
+        """
         if recipient.request is not None:
             recipient.request.deliver()
-            return
+            return True
 
         subscription = recipient.subscription
         if subscription is None:
-            return
+            return True
 
         filter_, entry = subscription
         queue = entry.queue
-        if queue is None:
-            log.warning("Dropped message for topic %r: filter %r has no consumer", recipient.message.topic, filter_)
-            return
-
         message = recipient.message
         if not entry.auto_ack and ack_callback is not None:
             message._ack_callback = ack_callback  # noqa: SLF001 - internal delivery contract
@@ -506,8 +506,9 @@ class InboundPublishFlow:
             queue.put_nowait(message)
         except asyncio.QueueFull:
             if not await self._put_when_room(entry, queue, message, filter_):
-                return
+                return False
         log.debug("Delivered message for topic %r to filter %r", message.topic, filter_)
+        return True
 
     async def _put_when_room(
         self,

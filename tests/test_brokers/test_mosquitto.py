@@ -142,6 +142,26 @@ class TestMosquittoV5(BaseTestMosquitto):
         with pytest.raises(asyncio.TimeoutError):  # trying to get msg from unsubscribed filter
             await asyncio.wait_for(sub.get_message(), timeout=0.5)
 
+    async def test_refused_unsubscribe_does_not_stall_the_connection(self, mqtt_client: MQTTClient) -> None:
+        """Walking away from a refused unsubscribe must not wedge the connection."""
+
+        suffix = uuid.uuid4().hex
+        denied_filter = f"zmqtt/unsuback/denied/{suffix}"
+        healthy_filter = f"zmqtt/healthy/{suffix}"
+        abandoned = mqtt_client.subscribe(denied_filter, receive_buffer_size=1)
+        await abandoned.start()
+        healthy = mqtt_client.subscribe(healthy_filter)
+        await healthy.start()
+
+        with pytest.raises(MQTTUnsubscribeError):
+            await abandoned.stop()
+        for index in range(4):
+            await mqtt_client.publish(denied_filter, f"m{index}".encode())
+        await mqtt_client.publish(healthy_filter, b"still-alive")
+        message = await asyncio.wait_for(healthy.get_message(), timeout=5.0)
+
+        assert message.payload == b"still-alive"
+
     async def test_reconnect_restores_only_filter_rejected_by_unsuback(self, mqtt_client: MQTTClient) -> None:
         """After reconnect, only the filter rejected by UNSUBACK receives messages."""
 

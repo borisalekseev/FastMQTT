@@ -329,6 +329,10 @@ class Subscription:
 
         try:
             await protocol.unsubscribe(self._registered_filters)
+        except asyncio.CancelledError:
+            # The caller stopped consuming, so nothing would drain these filters again.
+            self._abandon()
+            raise
         except MQTTUnsubscribeError as error:
             # A retry must target only what the broker still holds.
             self._registered_filters = [filter_ for filter_ in self._registered_filters if filter_ in error.failures]

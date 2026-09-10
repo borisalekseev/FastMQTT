@@ -119,11 +119,17 @@ except MQTTUnsubscribeError as error:
     print(error.reason_string)
 ```
 
+A rejected filter stays subscribed at the broker and keeps delivering to this
+subscription. Keep reading it and retry `stop()` later, or leave it alone: after
+`stop()` a full buffer drops messages with a `WARNING` instead of stalling the
+connection. See [Backpressure](advanced/backpressure.md#when-a-message-is-dropped)
+for what a drop costs at each QoS.
+
 The exception is also raised when cleanup runs through `async with`. If the
 subscription body already raised an application exception, both the body
 exception and the unsubscribe error are preserved in an exception group.
-Cancellation remains a cancellation; a rejected UNSUBACK during cancellation
-is logged as cleanup diagnostics.
+Cancellation remains a cancellation: cancelling a consumer, or cancelling
+`stop()`, gives the subscription up without sending UNSUBSCRIBE.
 
 ### `MQTTPublishError`
 

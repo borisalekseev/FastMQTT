@@ -17,7 +17,7 @@ class EntryState(enum.Enum):
 
 @dataclass(slots=True, kw_only=True)
 class SubscriptionEntry:
-    queue: asyncio.Queue[Message] | None
+    queue: asyncio.Queue[Message]
     state: EntryState = EntryState.OWNED
     detached: asyncio.Event = field(default_factory=asyncio.Event)
     auto_ack: bool = True
@@ -25,14 +25,12 @@ class SubscriptionEntry:
     subscription_identifier: int | None = None  # v5; echoed by the broker on PUBLISH
 
     def transition(self, state: EntryState) -> None:
-        """Move to ``state``, keeping the queue and the detach signal in step.
+        """Move to ``state``, keeping the detach signal in step.
 
         Derived here rather than remembered by callers: left set on a consuming
         entry, every delivery to a full queue is dropped instead of blocking.
         """
         self.state = state
-        if state is EntryState.RELEASED:
-            self.queue = None
         if state is EntryState.OWNED:
             self.detached.clear()
         else:
@@ -95,15 +93,6 @@ class SubscriptionIndex:
         entry.transition(EntryState.DRAINING)
         return True
 
-    def stop_draining(self, filter_: str) -> bool:
-        """Resume normal delivery for a filter the broker refused to release."""
-        entry = self._entries.get(filter_)
-        if entry is None or entry.state is not EntryState.DRAINING:
-            return False
-
-        entry.transition(EntryState.OWNED)
-        return True
-
     def release(self, filter_: str) -> bool:
         """Give up the consumer while leaving the filter registered at the broker."""
         entry = self._entries.get(filter_)
@@ -144,7 +133,6 @@ class SubscriptionIndex:
         return entry
 
     def _unlink(self, filter_: str, entry: SubscriptionEntry) -> None:
-        # Unroutable from here on, so nothing will ever consume this queue again.
         entry.transition(EntryState.RELEASED)
         tree_filter = entry.actual_filter or filter_
         self._remove_entry(tree_filter.split("/"), filter_, entry, self._root)

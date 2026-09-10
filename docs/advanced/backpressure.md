@@ -46,23 +46,35 @@ explicitly in application code.
 
 ## When a message is dropped
 
-Blocking on a full queue assumes someone will drain it. Between `stop()`
-sending UNSUBSCRIBE and the broker answering, that assumption no longer holds:
-the consumer has left, so a blocked delivery would hold the read loop — and
-every other subscription on the connection — indefinitely.
+A full buffer blocks delivery, and that is what applies backpressure — but it
+only works while something is draining the buffer. Once you call `stop()`, the
+subscription has said it is leaving, so delivery to it stops blocking: a blocked
+delivery would stall every other subscription sharing the connection.
 
-In that window, and only when the buffer is completely full, an arriving
-message is dropped and logged at `WARNING`. Messages already buffered are kept
-and can still be read after `stop()` returns. If the broker rejects the
-unsubscribe, the subscription stays active and delivery goes back to blocking.
+From that point messages still reach the subscription while its buffer has room.
+Only when the buffer is completely full is an arriving message dropped and
+logged at `WARNING`. Whatever is already buffered stays readable after `stop()`
+returns.
 
-A message is also dropped, again at `WARNING`, when it arrives for a filter
-whose consumer is already gone — a subscription cancelled mid-flight, or a
-QoS 2 exchange whose PUBREL lands after `stop()`.
+The same applies when the broker rejects the unsubscribe. The filter stays
+subscribed and keeps delivering, so you can go on reading it and retry `stop()`
+when you want — a buffer you are draining never fills, and you lose nothing.
+Stop reading it and its messages are dropped instead of stalling the connection.
 
-A dropped message at QoS 1 or 2 is still acknowledged, so the broker will not
-redeliver it. Draining the subscription before calling `stop()` avoids the
-window entirely.
+Messages are also dropped for a subscription that was cancelled, or whose
+`stop()` was cancelled: cancelling gives the subscription up.
+
+### What a drop costs
+
+| QoS | Cost |
+| --- | --- |
+| 0 | The message is gone. There is no acknowledgement to withhold. |
+| 1 | The message is **not** acknowledged, so the broker keeps it and redelivers it when the session resumes. That needs `clean_session=False`; under the default `clean_session=True` the session is discarded on disconnect and the message is gone. No broker redelivers within a live connection ([MQTT 5 §4.4]). |
+| 2 | The exchange is acknowledged at PUBREC, before delivery. A message whose PUBREL arrives after `stop()` is placed in the buffer, but if the buffer is full at that moment it is dropped and still completed, so the broker will not redeliver it. |
+
+Draining a subscription before calling `stop()` avoids all of this.
+
+[MQTT 5 §4.4]: https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901240
 
 ## Request / response
 

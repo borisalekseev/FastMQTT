@@ -21,9 +21,9 @@ from zmqtt._internal._compat import ExceptionGroup
 from zmqtt._internal.packets.codec import encode
 from zmqtt._internal.packets.connect import ConnAck
 from zmqtt._internal.packets.ping import PingResp
-from zmqtt._internal.packets.publish import Publish
+from zmqtt._internal.packets.publish import PubAck, Publish, PubRel
+from zmqtt._internal.packets.reader import PacketBuffer
 from zmqtt._internal.packets.subscribe import SubAck, UnsubAck
-from zmqtt._internal.subscription_index import EntryState
 from zmqtt._internal.transport.base import Transport
 from zmqtt.errors import MQTTDisconnectedError, MQTTProtocolError, MQTTUnsubscribeError
 
@@ -154,6 +154,21 @@ def publish_qos1_v5(topic: str, payload: bytes, *, packet_id: int) -> bytes:
         Publish(topic=topic, payload=payload, qos=QoS.AT_LEAST_ONCE, retain=False, dup=False, packet_id=packet_id),
         version="5.0",
     )
+
+
+def publish_qos2_v5(topic: str, payload: bytes, *, packet_id: int) -> bytes:
+    return encode(
+        Publish(topic=topic, payload=payload, qos=QoS.EXACTLY_ONCE, retain=False, dup=False, packet_id=packet_id),
+        version="5.0",
+    )
+
+
+def acknowledged_packet_ids(transport: FakeTransport) -> list[int]:
+    """Packet ids the client PUBACKed, in the order they went on the wire."""
+    buf = PacketBuffer(version="5.0")
+    for chunk in transport.sent:
+        buf.feed(chunk)
+    return [packet.packet_id for packet in buf if isinstance(packet, PubAck)]
 
 
 async def hold_subscription(
@@ -435,14 +450,14 @@ async def test_stop_after_unexpected_drop_detaches_subscription() -> None:
     assert subscription._registered_filters == []
 
 
-async def test_cancelled_stop_restores_blocking_delivery() -> None:
+async def test_cancelled_stop_gives_up_the_subscription() -> None:
+    """A cancelled stop() is a consumer that is done, not one that changed its mind."""
+
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
     subscription = client.subscribe("topic", receive_buffer_size=1)
     async with client:
         await start_subscription(subscription, transport)
-        protocol = client._protocol
-        assert protocol is not None
         transport.packet_sent.clear()
 
         stopped = asyncio.create_task(subscription.stop())
@@ -451,14 +466,14 @@ async def test_cancelled_stop_restores_blocking_delivery() -> None:
         with pytest.raises(asyncio.CancelledError):
             await stopped
         transport.feed(publish_v5("topic", b"first"))
-        transport.feed(publish_v5("topic", b"second"))
-        first = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
-        second = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
-        entry = protocol._state.subscriptions.get("topic")
+        transport.packet_sent.clear()
+        ping = asyncio.create_task(client.ping(timeout=0.2))
+        await transport.packet_sent.wait()
+        transport.feed(encode(PingResp(), version="5.0"))
 
-        assert entry is not None
-        assert entry.state is EntryState.OWNED
-        assert [first.payload, second.payload] == [b"first", b"second"]
+        assert await ping >= 0
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(subscription.get_message(), timeout=0.2)
 
 
 async def test_refused_response_observer_release_keeps_the_filter() -> None:
@@ -505,3 +520,113 @@ async def test_body_error_and_unexpected_cleanup_failure_are_combined() -> None:
         errors = exc_info.value.exceptions
         assert errors[0] is body_error
         assert isinstance(errors[1], MQTTProtocolError)
+
+
+async def test_dropped_message_is_not_acknowledged() -> None:
+    """A QoS 1 message the client throws away must stay redeliverable."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe("topic", receive_buffer_size=1)
+    async with client:
+        await start_subscription(subscription, transport)
+        transport.feed(publish_qos1_v5("topic", b"buffered", packet_id=10))
+        await asyncio.sleep(0)
+        transport.packet_sent.clear()
+
+        stopped = asyncio.create_task(subscription.stop())
+        await transport.packet_sent.wait()
+        transport.feed(publish_qos1_v5("topic", b"dropped", packet_id=11))
+        await asyncio.sleep(0)
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00,)), version="5.0"))
+        await asyncio.wait_for(stopped, timeout=0.2)
+
+        assert acknowledged_packet_ids(transport) == [10]
+
+
+async def test_message_without_a_subscriber_is_acknowledged() -> None:
+    """A message no filter matches is undeliverable, not abandoned."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe("topic")
+    async with client:
+        await start_subscription(subscription, transport)
+
+        transport.feed(publish_qos1_v5("nobody/listens", b"orphan", packet_id=12))
+        await asyncio.sleep(0)
+
+        assert 12 in acknowledged_packet_ids(transport)
+
+
+async def test_qos2_message_completed_after_stop_is_still_readable() -> None:
+    """A QoS 2 exchange the client committed to at PUBREC belongs in the buffer."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    subscription = client.subscribe("topic")
+    async with client:
+        await start_subscription(subscription, transport)
+        transport.feed(publish_qos2_v5("topic", b"in-flight", packet_id=7))
+        await asyncio.sleep(0)
+        transport.packet_sent.clear()
+
+        stopped = asyncio.create_task(subscription.stop())
+        await transport.packet_sent.wait()
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00,)), version="5.0"))
+        await asyncio.wait_for(stopped, timeout=0.2)
+        transport.feed(encode(PubRel(packet_id=7), version="5.0"))
+        message = await asyncio.wait_for(subscription.get_message(), timeout=0.2)
+
+        assert message.payload == b"in-flight"
+
+
+async def test_cancelled_stop_does_not_stall_the_connection() -> None:
+    """A subscription given up mid-stop() must not starve the rest of the connection."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    abandoned = client.subscribe("abandoned", receive_buffer_size=1)
+    other = client.subscribe("other")
+    async with client:
+        await start_subscription(abandoned, transport)
+        await start_subscription(other, transport)
+        transport.packet_sent.clear()
+
+        stopping = asyncio.create_task(abandoned.stop())
+        await transport.packet_sent.wait()
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stopping
+        for index in range(3):
+            transport.feed(publish_v5("abandoned", f"m{index}".encode()))
+        transport.feed(publish_v5("other", b"hello"))
+        message = await asyncio.wait_for(other.get_message(), timeout=0.2)
+
+        assert message.payload == b"hello"
+
+
+async def test_stop_without_a_verdict_does_not_stall_the_connection() -> None:
+    """An unusable UNSUBACK leaves the same departed consumer as a refusal."""
+
+    transport = FakeTransport(feed=CONNACK_V5)
+    client = v5_client(transport)
+    abandoned = client.subscribe("abandoned", receive_buffer_size=1)
+    other = client.subscribe("other")
+    async with client:
+        await start_subscription(abandoned, transport)
+        await start_subscription(other, transport)
+        transport.packet_sent.clear()
+
+        stopped = asyncio.create_task(abandoned.stop())
+        await transport.packet_sent.wait()
+        # Two reason codes for one filter: an answer the client cannot act on.
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00, 0x00)), version="5.0"))
+        with pytest.raises(MQTTProtocolError):
+            await asyncio.wait_for(stopped, timeout=0.2)
+        for index in range(3):
+            transport.feed(publish_v5("abandoned", f"m{index}".encode()))
+        transport.feed(publish_v5("other", b"hello"))
+        message = await asyncio.wait_for(other.get_message(), timeout=0.2)
+
+        assert message.payload == b"hello"

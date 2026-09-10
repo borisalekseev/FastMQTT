@@ -28,16 +28,6 @@ def test_draining_releases_a_suspended_delivery() -> None:
     assert entry.detached.is_set()
 
 
-def test_a_refused_unsubscribe_restores_blocking_delivery() -> None:
-    index, entry = _index()
-    index.start_draining("a")
-
-    index.stop_draining("a")
-
-    assert entry.state is EntryState.OWNED
-    assert not entry.detached.is_set()
-
-
 def test_releasing_keeps_the_registration_but_drops_the_consumer() -> None:
     index, entry = _index()
 

@@ -26,11 +26,17 @@ await sub.stop()
 
 `stop()` sends UNSUBSCRIBE and releases internal resources. It is safe to call even if the connection has already been lost, including after an unexpected disconnect: cleanup then completes locally and the subscription detaches.
 
-Cancelling a consumer instead of stopping it detaches locally without sending
-UNSUBSCRIBE — a cancelled task cannot wait for the acknowledgement. The broker
-may keep the subscription until the session ends, which for the default
-`clean_session=True` is no longer than the current connection. On a persistent
-session, prefer `stop()` over cancellation. On MQTT 5, a rejected UNSUBACK raises `MQTTUnsubscribeError`; successful filters are removed locally, while rejected filters remain active and can be retried.
+Cancelling a consumer, or cancelling `stop()` itself, gives the subscription up
+without sending UNSUBSCRIBE — a cancelled task cannot wait for the
+acknowledgement. The broker may keep the subscription until the session ends,
+which for the default `clean_session=True` is no longer than the current
+connection. On a persistent session, prefer `stop()` over cancellation.
+
+On MQTT 5, a rejected UNSUBACK raises `MQTTUnsubscribeError`; successful filters
+are removed locally, while rejected filters stay subscribed and keep delivering
+to this subscription, and can be retried. After `stop()` a full buffer drops
+messages instead of stalling the connection — see
+[Backpressure](advanced/backpressure.md#when-a-message-is-dropped).
 
 The broker's `0x00` (`Success`) and `0x11` (`No subscription existed`)
 reason codes both count as successful. See [Error handling](error-handling.md)
@@ -150,7 +156,7 @@ When two filters tie (same specificity), zmqtt logs a `WARNING` and routes the m
 !!! warning
     Subscribing the same filter string across two separate `Subscription` objects logs a `WARNING`. The second subscription gets no queue for that filter — it will receive `get_message()` results from other filters only. The SUBSCRIBE is still forwarded to the broker.
 
-    A subscription left owning no filter at all is not restored after a reconnect: it has nothing to resubscribe, and a SUBSCRIBE carrying no topic filter is a Protocol Error under MQTT 5 §3.8.3.
+    A subscription left owning no filter at all is not restored after a reconnect: it has nothing to resubscribe, and a SUBSCRIBE carrying no topic filter is a Protocol Error under MQTT 5 §3.8.3. It stays empty even if the first subscription is stopped later and the filter becomes free.
 
 ```python
 async with client.subscribe("data/temp") as sub1:

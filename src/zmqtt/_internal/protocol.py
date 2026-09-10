@@ -429,15 +429,7 @@ class MQTTProtocol:
         for filter_ in broker_filters:
             self._state.subscriptions.start_draining(filter_)
 
-        settled = False
-        try:
-            unsuback = await self._send_unsubscribe(broker_filters)
-            settled = True
-        finally:
-            # No verdict: the owner still holds these filters, so restore blocking delivery.
-            if not settled:
-                for filter_ in broker_filters:
-                    self._state.subscriptions.stop_draining(filter_)
+        unsuback = await self._send_unsubscribe(broker_filters)
 
         unsubscribe_error = _unsubscribe_error(broker_filters, unsuback)
         if unsubscribe_error is None:
@@ -445,11 +437,11 @@ class MQTTProtocol:
                 self._state.subscriptions.remove(filter_)
             return unsuback
 
+        # A refused filter keeps delivering but stays draining: its owner asked to leave,
+        # so a buffer it no longer reads must not hold the read loop for every subscription.
         for filter_, reason_code in zip(broker_filters, unsubscribe_error.reason_codes, strict=True):
             if reason_code in _UNSUBACK_SUCCESS_CODES:
                 self._state.subscriptions.remove(filter_)
-            else:
-                self._state.subscriptions.stop_draining(filter_)
         raise unsubscribe_error
 
     def release_filters(self, filters: list[str]) -> None:
