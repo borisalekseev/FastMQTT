@@ -271,8 +271,17 @@ class Subscription:
         if self._client._protocol is None:
             msg = "Not connected"
             raise MQTTDisconnectedError(msg)
-        self._client._subscriptions.append(self)
-        await self._do_subscribe(self._client._protocol)
+        # Registered before subscribing so a reconnect mid-SUBSCRIBE still restores it,
+        # but a failed start must not leave a second, unstoppable claim behind.
+        attached = self in self._client._subscriptions
+        if not attached:
+            self._client._subscriptions.append(self)
+        try:
+            await self._do_subscribe(self._client._protocol)
+        except BaseException:
+            if not attached:
+                self._detach()
+            raise
         return self
 
     async def __aexit__(
@@ -409,6 +418,10 @@ class Subscription:
         Example::
 
             await sub.stop()
+
+        Raises:
+            MQTTUnsubscribeError: If an MQTT 5.0 broker rejects one or more
+                filters in its UNSUBACK.
         """
         await self._stop()
 

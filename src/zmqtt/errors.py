@@ -1,4 +1,4 @@
-from zmqtt._internal.packets.properties import ConnAckProperties
+from zmqtt._internal.packets.properties import ConnAckProperties, UnsubAckProperties
 
 _REJECTION_THRESHOLD = 0x80
 
@@ -62,17 +62,21 @@ class MQTTUnsubscribeError(MQTTError):
 
     ``topic_filters`` and ``reason_codes`` retain the complete acknowledgement
     in request order.  ``failures`` is a convenient summary of the rejected filters.
+    ``reason_string`` and ``user_properties`` carry the broker's diagnostics.
     """
 
     def __init__(
         self,
         topic_filters: tuple[str, ...],
         reason_codes: tuple[int, ...],
-        reason_string: str | None,
+        *,
+        properties: UnsubAckProperties | None = None,
     ) -> None:
         self.topic_filters = topic_filters
         self.reason_codes = reason_codes
-        self.reason_string = reason_string
+        self.properties = properties
+        self.reason_string = properties.reason_string if properties is not None else None
+        self.user_properties = properties.user_properties if properties is not None else ()
         self.failures = {
             topic_filter: reason_code
             for topic_filter, reason_code in zip(topic_filters, reason_codes, strict=False)

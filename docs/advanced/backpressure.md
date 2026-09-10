@@ -47,20 +47,22 @@ explicitly in application code.
 ## When a message is dropped
 
 A full buffer blocks delivery, and that is what applies backpressure — but it
-only works while something is draining the buffer. Once you call `stop()`, the
-subscription has said it is leaving, so delivery to it stops blocking: a blocked
-delivery would stall every other subscription sharing the connection.
+only works while something is draining the buffer. Calling `stop()` says the
+subscription is leaving, so from that moment delivery to it never blocks again:
+a blocked delivery would stall every other subscription sharing the connection.
 
-From that point messages still reach the subscription while its buffer has room.
-Only when the buffer is completely full is an arriving message dropped and
-logged at `WARNING`. Whatever is already buffered stays readable after `stop()`
-returns.
+This concerns the two cases where messages still arrive after `stop()` — while
+the UNSUBSCRIBE is in flight, and after the broker rejects it. In both the
+filter is still subscribed: messages reach the subscription while its buffer has
+room, and once it is completely full an arriving message is dropped and logged
+at `WARNING`. A successful UNSUBACK ends delivery altogether. Either way,
+whatever is already buffered stays readable.
 
-This is permanent for the connection, which matters when the broker rejects the
-unsubscribe: the filter stays subscribed and keeps delivering, but never blocks
-again. A burst that outruns your reading loses messages even while you are
-reading. Size `receive_buffer_size` for that burst, or retry `stop()` until the
-broker accepts it. Only a reconnect restores blocking delivery.
+Not blocking is permanent for the connection, which matters after a rejection:
+the filter keeps delivering but never applies backpressure again, so a burst
+that outruns your reading loses messages even while you are reading. Size
+`receive_buffer_size` for that burst, or retry `stop()` until the broker accepts
+it. Only a reconnect restores blocking delivery.
 
 Messages are also dropped for a subscription that was cancelled, or whose
 `stop()` was cancelled: cancelling gives the subscription up.

@@ -102,7 +102,8 @@ in request order:
 - `topic_filters` contains all requested filters;
 - `reason_codes` contains the corresponding UNSUBACK reason codes;
 - `failures` maps only rejected filters to their reason codes;
-- `reason_string` contains the broker's optional diagnostic Reason String.
+- `reason_string` and `user_properties` carry the broker's diagnostics, and
+  `properties` the whole `UnsubAckProperties` they came from.
 
 `0x00` (`Success`) and `0x11` (`No subscription existed`) are successful
 outcomes. With a mixed response, successful filters are removed locally while

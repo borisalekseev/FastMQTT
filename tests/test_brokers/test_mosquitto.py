@@ -100,20 +100,6 @@ class TestMosquittoV5(BaseTestMosquitto):
         assert msg.topic == topic
         assert msg.payload == b"payload-qos0"
 
-    async def test_rejected_unsubscribe_raises_error(self, mqtt_client: MQTTClient) -> None:
-        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
-
-        sub = mqtt_client.subscribe(denied_filter)
-        await sub.start()
-        with pytest.raises(MQTTUnsubscribeError) as exc_info:
-            await sub.stop()
-
-        error = exc_info.value
-        assert error.failures == {denied_filter: 0x87}
-        assert error.topic_filters == (denied_filter,)
-        assert error.reason_codes == (0x87,)
-        assert error.reason_string is None
-
     async def test_mixed_unsubscribe_reports_only_rejected_filter(self, mqtt_client: MQTTClient) -> None:
         suffix = uuid.uuid4().hex
         allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
@@ -134,6 +120,7 @@ class TestMosquittoV5(BaseTestMosquitto):
         assert error.failures == {denied_filter: 0x87}
         assert error.topic_filters == (allowed_filter, denied_filter)
         assert error.reason_codes == (0x00, 0x87)
+        assert error.reason_string is None  # this broker sends no diagnostic
         assert retry_error.failures == {denied_filter: 0x87}
         assert retry_error.topic_filters == (denied_filter,)
         assert retry_error.reason_codes == (0x87,)

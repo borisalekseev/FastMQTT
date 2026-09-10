@@ -132,11 +132,10 @@ def _validate_unsuback(
 def _unsubscribe_error(filters: list[str], unsuback: UnsubAck) -> MQTTUnsubscribeError | None:
     if not any(reason_code >= 0x80 for reason_code in unsuback.reason_codes):
         return None
-    properties = unsuback.properties
     return MQTTUnsubscribeError(
         tuple(filters),
         unsuback.reason_codes,
-        properties.reason_string if properties is not None else None,
+        properties=unsuback.properties,
     )
 
 
