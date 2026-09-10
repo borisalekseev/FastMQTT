@@ -40,6 +40,7 @@ from zmqtt.errors import (
     MQTTDisconnectedError,
     MQTTProtocolError,
     MQTTPublishError,
+    MQTTQoSExceededError,
     MQTTSubscribeError,
     MQTTTimeoutError,
     MQTTUnsubscribeError,
@@ -201,6 +202,10 @@ class MQTTProtocol:
         self._subscription_guards = _SubscriptionGuards()
         self._disconnecting = False
         self._dead = False
+        # MQTT 5 §3.2.2.3.4: absent Maximum QoS means the server accepts QoS 2,
+        # and 3.1.1 has no CONNACK properties at all — default to EXACTLY_ONCE
+        # so publish() never has to branch on None.
+        self._max_publish_qos: QoS = QoS.EXACTLY_ONCE
         self.started_event = asyncio.Event()
 
     async def connect(self, packet: Connect) -> ConnAck:
@@ -231,6 +236,12 @@ class MQTTProtocol:
                 if pkt.return_code != 0:
                     raise MQTTConnectError(pkt.return_code, properties=pkt.properties)
                 log.info("Connected with session_present=%s", pkt.session_present)
+                if self._version == "5.0" and pkt.properties is not None:
+                    # Properties present but Maximum QoS absent: spec default is QoS 2.
+                    max_qos = pkt.properties.maximum_qos
+                    self._max_publish_qos = QoS.EXACTLY_ONCE if max_qos is None else QoS(max_qos)
+                else:  # 3.1.1 has no CONNACK properties: no limit.
+                    self._max_publish_qos = QoS.EXACTLY_ONCE
                 self.inbound.begin_session(session_present=pkt.session_present)
                 return pkt
 
@@ -301,6 +312,9 @@ class MQTTProtocol:
         Publish a message. Returns PubAck (QoS 1), PubComp (QoS 2), or None (QoS 0).
         """
         self._ensure_alive()
+        max_qos = self._max_publish_qos
+        if packet.qos > max_qos:
+            raise MQTTQoSExceededError(requested=int(packet.qos), maximum=int(max_qos))
         match packet.qos:
             case QoS.AT_MOST_ONCE:
                 await self._send(self._encode(packet))
