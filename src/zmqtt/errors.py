@@ -55,6 +55,15 @@ class MQTTSubscribeError(MQTTError):
         super().__init__(f"Broker rejected subscription: {rendered}")
 
 
+class MQTTTopicAliasError(MQTTError):
+    """An outgoing PUBLISH misused Topic Alias (MQTT 5 §3.3.2.3.4).
+
+    Raised locally, before the packet is sent: alias 0 or out of the 1..65535
+    range, above the server's Topic Alias Maximum from CONNACK, or an empty
+    Topic Name referencing an alias never registered on this connection.
+    """
+
+
 class MQTTPublishError(MQTTError):
     """The broker rejected a QoS 1/2 publish.
 

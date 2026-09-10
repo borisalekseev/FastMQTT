@@ -29,6 +29,7 @@ from zmqtt.errors import (
     MQTTQoSExceededError,
     MQTTSubscribeError,
     MQTTTimeoutError,
+    MQTTTopicAliasError,
 )
 
 __all__ = (
@@ -48,6 +49,7 @@ __all__ = (
     "MQTTQoSExceededError",
     "MQTTSubscribeError",
     "MQTTTimeoutError",
+    "MQTTTopicAliasError",
     "Message",
     "PublishProperties",
     "QoS",

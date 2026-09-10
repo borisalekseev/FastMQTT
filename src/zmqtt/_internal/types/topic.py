@@ -1,8 +1,21 @@
 from zmqtt.errors import MQTTInvalidTopicError
 
+# Alias values travel as a two-byte integer; 0 is a protocol error (§3.3.2.3.4).
+_MAX_ALIAS = 65535
 
-def validate_publish(topic: str) -> None:
+
+def validate_publish(topic: str, *, topic_alias: int | None = None) -> None:
+    """Validate an outgoing PUBLISH topic (MQTT 5 §3.3.2.3.4 aware).
+
+    An empty Topic Name is legal only when a Topic Alias accompanies it;
+    the alias value itself is validated against 1..65535.
+    """
     if not topic:
+        if topic_alias is not None:
+            if not 1 <= topic_alias <= _MAX_ALIAS:
+                msg = f"Topic Alias must be in 1..{_MAX_ALIAS}, got {topic_alias}"
+                raise MQTTInvalidTopicError(msg)
+            return
         msg = "Topic must not be empty"
         raise MQTTInvalidTopicError(msg)
     if "#" in topic or "+" in topic:
