@@ -6,6 +6,7 @@ from collections.abc import Callable
 import pytest
 
 from zmqtt._internal.subscription_index import SubscriptionEntry, SubscriptionIndex
+from zmqtt._internal.types.message import Message
 
 
 def _index() -> tuple[SubscriptionIndex, SubscriptionEntry]:
@@ -54,8 +55,8 @@ def test_a_removed_entry_is_no_longer_routed() -> None:
 
 def test_owned_by_identifies_entries_by_their_queue() -> None:
     index = SubscriptionIndex()
-    mine: asyncio.Queue = asyncio.Queue()
-    theirs: asyncio.Queue = asyncio.Queue()
+    mine: asyncio.Queue[Message] = asyncio.Queue()
+    theirs: asyncio.Queue[Message] = asyncio.Queue()
     index.add("a", SubscriptionEntry(queue=mine))
     index.add("b", SubscriptionEntry(queue=theirs))
     index.add("c", SubscriptionEntry(queue=mine))
