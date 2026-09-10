@@ -84,6 +84,11 @@ class SubscriptionIndex:
         entry = self._entries.get(filter_)
         return entry is not None and entry.state is not EntryState.RELEASED
 
+    def is_departing(self, filter_: str) -> bool:
+        """The owner asked to leave and the broker has not released the filter yet."""
+        entry = self._entries.get(filter_)
+        return entry is not None and entry.state is EntryState.DRAINING
+
     def start_draining(self, filter_: str) -> bool:
         """Await the broker's verdict: still registered and routable, but never blocking."""
         entry = self._entries.get(filter_)

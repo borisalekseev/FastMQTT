@@ -28,7 +28,7 @@ from zmqtt._internal.transport.base import Transport
 from zmqtt.errors import MQTTDisconnectedError, MQTTProtocolError, MQTTUnsubscribeError
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine
 
 
 def test_mqtt_connect_timeout_default_is_30s() -> None:
@@ -386,29 +386,27 @@ async def test_stop_reports_unsuback_rejection_and_keeps_observed_filter() -> No
         assert replacement_message.payload == b"replacement-still-active"
 
 
-async def test_stop_completes_when_messages_precede_unsuback_for_observed_filter() -> None:
-    """A filter kept for a pending request must not stall a following UNSUBACK."""
+async def test_resubscribing_a_refused_filter_is_refused() -> None:
+    """A filter its owner failed to release must not hand back a silent, dead subscription."""
 
-    owned_filter = "allowed"
-    reply_filter = "reply"
+    denied_filter = "denied"
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
-    subscription = client.subscribe(owned_filter, reply_filter, receive_buffer_size=1)
+    subscription = client.subscribe(denied_filter)
     async with client:
-        await start_subscription(subscription, transport, return_codes=(0x00, 0x00))
-        protocol = client._protocol
-        assert protocol is not None
-        await protocol.add_response_observer(reply_filter)
+        await start_subscription(subscription, transport)
         transport.packet_sent.clear()
-
         stopped = asyncio.create_task(subscription.stop())
         await transport.packet_sent.wait()
-        transport.feed(publish_v5(reply_filter, b"first"))
-        transport.feed(publish_v5(reply_filter, b"second"))
-        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00,)), version="5.0"))
-        await asyncio.wait_for(stopped, timeout=0.2)
+        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x87,)), version="5.0"))
+        with pytest.raises(MQTTUnsubscribeError):
+            await stopped
+        packets_after_refusal = len(transport.sent)
 
-        assert subscription not in client._subscriptions
+        with pytest.raises(RuntimeError, match="still held by a subscription"):
+            await client.subscribe(denied_filter).start()
+
+        assert len(transport.sent) == packets_after_refusal  # refused before reaching the wire
 
 
 async def test_stop_sends_no_packet_for_an_observed_filter() -> None:
@@ -581,8 +579,27 @@ async def test_qos2_message_completed_after_stop_is_still_readable() -> None:
         assert message.payload == b"in-flight"
 
 
-async def test_cancelled_stop_does_not_stall_the_connection() -> None:
-    """A subscription given up mid-stop() must not starve the rest of the connection."""
+def cancel_stop(stopping: "asyncio.Task[None]", transport: FakeTransport) -> None:  # noqa: ARG001
+    stopping.cancel()
+
+
+def answer_without_a_verdict(stopping: "asyncio.Task[None]", transport: FakeTransport) -> None:  # noqa: ARG001
+    """Two reason codes for one filter: an answer the client cannot act on."""
+    transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00, 0x00)), version="5.0"))
+
+
+@pytest.mark.parametrize(
+    ("end_stop", "expected_error"),
+    [
+        (cancel_stop, asyncio.CancelledError),
+        (answer_without_a_verdict, MQTTProtocolError),
+    ],
+)
+async def test_departed_consumer_does_not_stall_the_connection(
+    end_stop: "Callable[[asyncio.Task[None], FakeTransport], None]",
+    expected_error: type[BaseException],
+) -> None:
+    """However stop() ends, the consumer is gone and must not starve the connection."""
 
     transport = FakeTransport(feed=CONNACK_V5)
     client = v5_client(transport)
@@ -595,35 +612,9 @@ async def test_cancelled_stop_does_not_stall_the_connection() -> None:
 
         stopping = asyncio.create_task(abandoned.stop())
         await transport.packet_sent.wait()
-        stopping.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await stopping
-        for index in range(3):
-            transport.feed(publish_v5("abandoned", f"m{index}".encode()))
-        transport.feed(publish_v5("other", b"hello"))
-        message = await asyncio.wait_for(other.get_message(), timeout=0.2)
-
-        assert message.payload == b"hello"
-
-
-async def test_stop_without_a_verdict_does_not_stall_the_connection() -> None:
-    """An unusable UNSUBACK leaves the same departed consumer as a refusal."""
-
-    transport = FakeTransport(feed=CONNACK_V5)
-    client = v5_client(transport)
-    abandoned = client.subscribe("abandoned", receive_buffer_size=1)
-    other = client.subscribe("other")
-    async with client:
-        await start_subscription(abandoned, transport)
-        await start_subscription(other, transport)
-        transport.packet_sent.clear()
-
-        stopped = asyncio.create_task(abandoned.stop())
-        await transport.packet_sent.wait()
-        # Two reason codes for one filter: an answer the client cannot act on.
-        transport.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x00, 0x00)), version="5.0"))
-        with pytest.raises(MQTTProtocolError):
-            await asyncio.wait_for(stopped, timeout=0.2)
+        end_stop(stopping, transport)
+        with pytest.raises(expected_error):
+            await asyncio.wait_for(stopping, timeout=0.2)
         for index in range(3):
             transport.feed(publish_v5("abandoned", f"m{index}".encode()))
         transport.feed(publish_v5("other", b"hello"))

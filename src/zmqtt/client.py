@@ -265,6 +265,8 @@ class Subscription:
 
         Raises:
             MQTTDisconnectedError: If the client is not currently connected.
+            RuntimeError: If a filter is still held by a subscription whose
+                unsubscribe the broker refused.
         """
         if self._client._protocol is None:
             msg = "Not connected"
@@ -393,6 +395,8 @@ class Subscription:
 
         Raises:
             MQTTDisconnectedError: If the client is not currently connected.
+            RuntimeError: If a filter is still held by a subscription whose
+                unsubscribe the broker refused.
         """
         await self.__aenter__()
 

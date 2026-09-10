@@ -384,6 +384,12 @@ class MQTTProtocol:
         for req in filters:
             f = req.topic_filter
             if self._state.subscriptions.has_consumer(f):
+                if self._state.subscriptions.is_departing(f):
+                    msg = (
+                        f"Filter {f!r} is still held by a subscription whose unsubscribe "
+                        f"the broker refused; retry that subscription's stop() first"
+                    )
+                    raise RuntimeError(msg)
                 log.warning("Filter %r already subscribed (ignored)", f)
             else:
                 new_entries[f] = SubscriptionEntry(

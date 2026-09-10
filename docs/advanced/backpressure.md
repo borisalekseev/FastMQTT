@@ -56,10 +56,11 @@ Only when the buffer is completely full is an arriving message dropped and
 logged at `WARNING`. Whatever is already buffered stays readable after `stop()`
 returns.
 
-The same applies when the broker rejects the unsubscribe. The filter stays
-subscribed and keeps delivering, so you can go on reading it and retry `stop()`
-when you want — a buffer you are draining never fills, and you lose nothing.
-Stop reading it and its messages are dropped instead of stalling the connection.
+This is permanent for the connection, which matters when the broker rejects the
+unsubscribe: the filter stays subscribed and keeps delivering, but never blocks
+again. A burst that outruns your reading loses messages even while you are
+reading. Size `receive_buffer_size` for that burst, or retry `stop()` until the
+broker accepts it. Only a reconnect restores blocking delivery.
 
 Messages are also dropped for a subscription that was cancelled, or whose
 `stop()` was cancelled: cancelling gives the subscription up.

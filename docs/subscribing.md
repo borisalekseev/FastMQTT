@@ -33,9 +33,11 @@ which for the default `clean_session=True` is no longer than the current
 connection. On a persistent session, prefer `stop()` over cancellation.
 
 On MQTT 5, a rejected UNSUBACK raises `MQTTUnsubscribeError`; successful filters
-are removed locally, while rejected filters stay subscribed and keep delivering
-to this subscription, and can be retried. After `stop()` a full buffer drops
-messages instead of stalling the connection — see
+are removed locally, while rejected filters stay subscribed, keep delivering to
+this subscription, and can be retried. A rejected filter also stays owned by it,
+so `start()` on a new subscription to that filter raises `RuntimeError` until a
+retry succeeds. After `stop()` a full buffer drops messages instead of stalling
+the connection, even while you are reading — see
 [Backpressure](advanced/backpressure.md#when-a-message-is-dropped).
 
 The broker's `0x00` (`Success`) and `0x11` (`No subscription existed`)

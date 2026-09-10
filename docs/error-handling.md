@@ -120,10 +120,11 @@ except MQTTUnsubscribeError as error:
 ```
 
 A rejected filter stays subscribed at the broker and keeps delivering to this
-subscription. Keep reading it and retry `stop()` later, or leave it alone: after
-`stop()` a full buffer drops messages with a `WARNING` instead of stalling the
-connection. See [Backpressure](advanced/backpressure.md#when-a-message-is-dropped)
-for what a drop costs at each QoS.
+subscription, so you can keep reading it and retry `stop()` later. It also stays
+owned by this subscription, so subscribing to it again raises `RuntimeError`
+until a retry succeeds. Note that after `stop()` the subscription is lossy on a
+burst — see
+[Backpressure](advanced/backpressure.md#when-a-message-is-dropped).
 
 The exception is also raised when cleanup runs through `async with`. If the
 subscription body already raised an application exception, both the body
