@@ -129,7 +129,7 @@ async def test_v5_connack_with_properties_but_no_maximum_qos() -> None:
         )
     )
     await protocol.connect(Connect(client_id="c", clean_session=True, keepalive=60))
-    assert protocol._max_publish_qos is None
+    assert protocol._max_publish_qos is QoS.EXACTLY_ONCE
     transport.sent.clear()
 
     read_task = await _run_read_loop(protocol)
@@ -189,7 +189,7 @@ async def test_reconnect_refreshes_limit() -> None:
     # Fresh protocol object per connection mirrors _connect_with_retry, which
     # builds a new MQTTProtocol each attempt; verify the new limit applies.
     protocol1, _ = await _connected_protocol(maximum_qos=None)
-    assert protocol1._max_publish_qos is None
+    assert protocol1._max_publish_qos is QoS.EXACTLY_ONCE
 
     protocol2, transport2 = await _connected_protocol(maximum_qos=0)
     assert protocol2._max_publish_qos == 0
