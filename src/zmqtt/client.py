@@ -259,6 +259,7 @@ class Subscription:
         self._retain_handling = retain_handling
         self._subscription_identifier = subscription_identifier
         self._registered_filters: list[str] = []
+        self._departed = False
 
     async def __aenter__(self) -> Self:
         """Register the subscription filters with the broker.
@@ -273,6 +274,7 @@ class Subscription:
             raise MQTTDisconnectedError(msg)
         # Registered before subscribing so a reconnect mid-SUBSCRIBE still restores it,
         # but a failed start must not leave a second, unstoppable claim behind.
+        self._departed = False
         attached = self in self._client._subscriptions
         if not attached:
             self._client._subscriptions.append(self)
@@ -329,6 +331,9 @@ class Subscription:
         log.warning("Subscription cleanup failed", exc_info=cleanup_error)
 
     async def _stop(self) -> None:
+        # From here on nothing is expected to drain this subscription, whatever
+        # the broker answers — a reconnect must not quietly make it blocking again.
+        self._departed = True
         if not self._registered_filters:
             self._detach()
             return
@@ -388,6 +393,8 @@ class Subscription:
     async def _reconnect(self, protocol: MQTTProtocol) -> None:
         """Re-subscribe on a fresh protocol after reconnection."""
         await self._do_subscribe(protocol, self._registered_filters)
+        if self._departed:
+            protocol.mark_departing(self._registered_filters)
 
     async def start(self) -> None:
         """Register the subscription filters with the broker.

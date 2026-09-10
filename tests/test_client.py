@@ -24,9 +24,9 @@ from zmqtt._internal.packets.ping import PingResp
 from zmqtt._internal.packets.properties import UnsubAckProperties
 from zmqtt._internal.packets.publish import PubAck, Publish, PubRel
 from zmqtt._internal.packets.reader import PacketBuffer
-from zmqtt._internal.packets.subscribe import SubAck, UnsubAck
+from zmqtt._internal.packets.subscribe import SubAck, Subscribe, UnsubAck
 from zmqtt._internal.transport.base import Transport
-from zmqtt.errors import MQTTProtocolError, MQTTSubscribeError, MQTTUnsubscribeError
+from zmqtt.errors import MQTTDisconnectedError, MQTTProtocolError, MQTTSubscribeError, MQTTUnsubscribeError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -191,6 +191,38 @@ async def start_consumer(
     return task
 
 
+class BreakableTransport(FakeTransport):
+    """FakeTransport whose reads start failing once the peer goes away."""
+
+    def __init__(self, feed: bytes | None = None) -> None:
+        super().__init__(feed)
+        self.broken = False
+
+    async def read(self, n: int) -> bytes:  # noqa: ARG002
+        while not self._rx:
+            if self.broken:
+                msg = "Connection lost"
+                raise MQTTDisconnectedError(msg)
+            await asyncio.sleep(0)
+        return self._rx.popleft()
+
+
+async def answer_restored_subscribes(transport: FakeTransport, *, count: int) -> None:
+    """Feed one SUBACK per SUBSCRIBE a reconnect re-sends, in the order they go out."""
+    answered = 0
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while answered < count:
+        if asyncio.get_running_loop().time() > deadline:
+            pytest.fail(f"reconnect resubscribed {answered} of {count} subscriptions")
+        buf = PacketBuffer(version="5.0")
+        for chunk in transport.sent:
+            buf.feed(chunk)
+        if sum(isinstance(packet, Subscribe) for packet in buf) > answered:
+            transport.feed(encode(SubAck(packet_id=1, return_codes=(0x00,)), version="5.0"))
+            answered += 1
+        await asyncio.sleep(0.001)
+
+
 async def test_connect_retries_after_connack_timeout() -> None:
     connack = encode(ConnAck(session_present=False, return_code=0), version="3.1.1")
     transports = [
@@ -352,6 +384,45 @@ async def test_rejected_unsubscribe_preserves_broker_diagnostics() -> None:
         assert error.reason_string == "Not authorized"
         assert error.user_properties == (("policy", "read-only"), ("ticket", "OPS-42"))
         assert error.properties == properties
+
+
+async def test_reconnect_keeps_a_departed_subscription_non_blocking() -> None:
+    """A refused stop() leaves nobody reading; a reconnect must not make it blocking again."""
+
+    first = BreakableTransport(feed=CONNACK_V5)
+    second = BreakableTransport(feed=CONNACK_V5)
+    made: list[BreakableTransport] = []
+
+    async def factory(host: str, port: int, tls: ssl.SSLContext | bool | None) -> Transport:  # noqa: ARG001
+        made.append(first if not made else second)
+        return made[-1]
+
+    client = MQTTClient(
+        "localhost",
+        version="5.0",
+        transport_factory=factory,
+        reconnect=ReconnectConfig(enabled=True, initial_delay=0.01),
+    )
+    async with client:
+        other = client.subscribe("other")
+        await start_subscription(other, first)
+        departed = client.subscribe("denied", receive_buffer_size=1)
+        await start_subscription(departed, first)
+        first.packet_sent.clear()
+        stopped = asyncio.create_task(departed.stop())
+        await first.packet_sent.wait()
+        first.feed(encode(UnsubAck(packet_id=1, reason_codes=(0x87,)), version="5.0"))
+        with pytest.raises(MQTTUnsubscribeError):
+            await stopped
+
+        first.broken = True
+        await answer_restored_subscribes(second, count=2)
+        for index in range(3):  # more than the departed buffer holds
+            second.feed(publish_v5("denied", f"m{index}".encode()))
+        second.feed(publish_v5("other", b"hello"))
+        message = await asyncio.wait_for(other.get_message(), timeout=1.0)
+
+        assert message.payload == b"hello"
 
 
 async def test_resubscribing_a_refused_filter_is_refused() -> None:

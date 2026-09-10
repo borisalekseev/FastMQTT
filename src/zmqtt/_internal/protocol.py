@@ -463,6 +463,15 @@ class MQTTProtocol:
                 self._state.subscriptions.remove(filter_)
         raise unsubscribe_error
 
+    def mark_departing(self, filters: list[str]) -> None:
+        """Re-register filters for an owner that already asked to leave.
+
+        A reconnect rebuilds every entry as owned, which would make a buffer
+        nobody drains block the read loop for the whole connection again.
+        """
+        for filter_ in filters:
+            self._state.subscriptions.start_draining(filter_)
+
     def release_filters(self, filters: list[str]) -> None:
         """Give up ownership without asking the broker.
 
