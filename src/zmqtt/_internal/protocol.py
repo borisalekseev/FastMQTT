@@ -60,6 +60,15 @@ _PUBLISH_REASON_NAMES: Final[dict[int, str]] = {
     0x99: "Payload format invalid",
 }
 
+# MQTT 5.0 §3.11.3
+_UNSUBACK_REASON_NAMES: Final[dict[int, str]] = {
+    0x80: "Unspecified error",
+    0x83: "Implementation specific error",
+    0x87: "Not authorized",
+    0x8F: "Topic Filter invalid",
+    0x91: "Packet Identifier in use",
+}
+
 
 class _SubscriptionGuard:
     def __init__(self) -> None:
@@ -108,16 +117,6 @@ def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAc
     failures = {req.topic_filter: code for req, code in zip(filters, suback.return_codes, strict=False) if code >= 0x80}
     if failures:
         raise MQTTSubscribeError(failures)
-
-
-# MQTT 5.0 §3.11.3
-_UNSUBACK_REASON_NAMES: Final[dict[int, str]] = {
-    0x80: "Unspecified error",
-    0x83: "Implementation specific error",
-    0x87: "Not authorized",
-    0x8F: "Topic Filter invalid",
-    0x91: "Packet Identifier in use",
-}
 
 
 def _warn_on_rejected_unsubscribe(filters: list[str], unsuback: UnsubAck) -> None:
@@ -427,18 +426,15 @@ class MQTTProtocol:
         for f in filters:
             self._state.subscriptions.remove(f)
 
-        unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
-        if unsuback is not None:
+        acknowledged = None
+        if broker_filters:
+            unsuback = await self._send_unsubscribe(broker_filters)
             _warn_on_rejected_unsubscribe(broker_filters, unsuback)
+            acknowledged = (tuple(broker_filters), unsuback)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
             await self._send_subscribe(requests, subscription_identifier=None)
-        if unsuback is None:
-            return None
-        if self._version == "5.0" and len(unsuback.reason_codes) != len(broker_filters):
-            msg = f"UNSUBACK carries {len(unsuback.reason_codes)} reason codes for {len(broker_filters)} filters"
-            raise MQTTProtocolError(msg)
-        return tuple(broker_filters), unsuback
+        return acknowledged
 
     async def add_response_observer(self, topic: str) -> None:
         """Keep an exact response topic subscribed for pending requests."""
