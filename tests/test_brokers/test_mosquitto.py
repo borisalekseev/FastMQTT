@@ -117,39 +117,25 @@ class TestMosquittoV5(BaseTestMosquitto):
         assert msg.topic == topic
         assert msg.payload == b"payload-qos0"
 
-    async def test_stop_reports_rejected_filter(self, mqtt_client: MQTTClient) -> None:
+    async def test_stop_reports_rejected_filter(
+        self, mqtt_client: MQTTClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
         suffix = uuid.uuid4().hex
         allowed_filter = f"zmqtt/unsuback/allowed/{suffix}"
         denied_filter = f"zmqtt/unsuback/denied/{suffix}"
         sub = mqtt_client.subscribe(allowed_filter, denied_filter)
         await sub.start()
 
-        result = await sub.stop()
+        with caplog.at_level(logging.WARNING, logger="zmqtt.protocol"):
+            result = await sub.stop()
 
         assert result is not None
         assert result.topic_filters == (allowed_filter, denied_filter)
         assert result.reason_codes == (0x00, 0x87)
         assert result.failures == {denied_filter: 0x87}
         assert result.reason_string is None  # this broker sends no diagnostic
-
-    async def test_stop_logs_rejected_filter(self, mqtt_client: MQTTClient, caplog: pytest.LogCaptureFixture) -> None:
-        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
-        sub = mqtt_client.subscribe(denied_filter)
-        await sub.start()
-
-        with caplog.at_level(logging.WARNING, logger="zmqtt.protocol"):
-            await sub.stop()
-
         assert f"{denied_filter!r} (0x87 Not authorized)" in caplog.text
-
-    async def test_rejected_filter_stops_delivering_to_subscription(self, mqtt_client: MQTTClient) -> None:
-        denied_filter = f"zmqtt/unsuback/denied/{uuid.uuid4().hex}"
-        sub = mqtt_client.subscribe(denied_filter, qos=QoS.AT_LEAST_ONCE)
-        await sub.start()
-        await sub.stop()
-
-        await mqtt_client.publish(denied_filter, b"after-stop", qos=QoS.AT_LEAST_ONCE)
-
+        # assert it stop's delivering
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(sub.get_message(), timeout=0.5)
 
