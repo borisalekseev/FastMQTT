@@ -110,6 +110,32 @@ def _raise_on_rejected_filters(filters: list[SubscriptionRequest], suback: SubAc
         raise MQTTSubscribeError(failures)
 
 
+# MQTT 5.0 §3.11.3
+_UNSUBACK_REASON_NAMES: Final[dict[int, str]] = {
+    0x80: "Unspecified error",
+    0x83: "Implementation specific error",
+    0x87: "Not authorized",
+    0x8F: "Topic Filter invalid",
+    0x91: "Packet Identifier in use",
+}
+
+
+def _warn_on_rejected_unsubscribe(filters: list[str], unsuback: UnsubAck) -> None:
+    rejected = [
+        f"{f!r} (0x{code:02X} {_UNSUBACK_REASON_NAMES.get(code, 'Unknown')})"
+        for f, code in zip(filters, unsuback.reason_codes, strict=False)
+        if code >= 0x80
+    ]
+    if not rejected:
+        return
+    reason_string = unsuback.properties.reason_string if unsuback.properties is not None else None
+    log.warning(
+        "Broker rejected unsubscribe of %s%s; it may keep delivering messages on these filters",
+        ", ".join(rejected),
+        f" ({reason_string})" if reason_string else "",
+    )
+
+
 def _publish_error(packet: PubAck | PubRec) -> MQTTPublishError:
     return MQTTPublishError(
         packet.reason_code,
@@ -384,16 +410,17 @@ class MQTTProtocol:
                 for f in new_entries:
                     self._state.subscriptions.remove(f)
 
-    async def unsubscribe(self, filters: list[str]) -> UnsubAck | None:
+    async def unsubscribe(self, filters: list[str]) -> tuple[tuple[str, ...], UnsubAck] | None:
         """Remove queues and unsubscribe filters without response observers.
 
-        Returns ``None`` when every broker subscription must stay active for
-        request/response routing.
+        Returns the filters sent to the broker with its UNSUBACK, or ``None``
+        when every broker subscription must stay active for request/response
+        routing.
         """
         async with self._subscription_guards.hold(filters):
             return await self._unsubscribe(filters)
 
-    async def _unsubscribe(self, filters: list[str]) -> UnsubAck | None:
+    async def _unsubscribe(self, filters: list[str]) -> tuple[tuple[str, ...], UnsubAck] | None:
         self._ensure_alive()
         observed_filters = [f for f in filters if self._state.subscriptions.has_response_observer(f)]
         broker_filters = [f for f in filters if f not in observed_filters]
@@ -401,10 +428,17 @@ class MQTTProtocol:
             self._state.subscriptions.remove(f)
 
         unsuback = await self._send_unsubscribe(broker_filters) if broker_filters else None
+        if unsuback is not None:
+            _warn_on_rejected_unsubscribe(broker_filters, unsuback)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
             await self._send_subscribe(requests, subscription_identifier=None)
-        return unsuback
+        if unsuback is None:
+            return None
+        if self._version == "5.0" and len(unsuback.reason_codes) != len(broker_filters):
+            msg = f"UNSUBACK carries {len(unsuback.reason_codes)} reason codes for {len(broker_filters)} filters"
+            raise MQTTProtocolError(msg)
+        return tuple(broker_filters), unsuback
 
     async def add_response_observer(self, topic: str) -> None:
         """Keep an exact response topic subscribed for pending requests."""
@@ -436,7 +470,8 @@ class MQTTProtocol:
             return
         if self._state.subscriptions.contains(topic) or self._dead:
             return
-        await self._send_unsubscribe([topic])
+        unsuback = await self._send_unsubscribe([topic])
+        _warn_on_rejected_unsubscribe([topic], unsuback)
 
     async def _send_subscribe(
         self,

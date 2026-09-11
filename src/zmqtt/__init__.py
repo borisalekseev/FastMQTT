@@ -4,6 +4,7 @@ from zmqtt._internal.packets.properties import (
     ConnAckProperties,
     ConnectProperties,
     PublishProperties,
+    UnsubAckProperties,
     WillProperties,
 )
 from zmqtt._internal.topic_matching import topic_matches
@@ -17,6 +18,7 @@ from zmqtt.client import (
     MQTTClientV311,
     ReconnectConfig,
     Subscription,
+    UnsubscribeResult,
     create_client,
 )
 from zmqtt.errors import (
@@ -54,6 +56,8 @@ __all__ = (
     "ReconnectConfig",
     "RetainHandling",
     "Subscription",
+    "UnsubAckProperties",
+    "UnsubscribeResult",
     "Will",
     "WillProperties",
     "create_client",

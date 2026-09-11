@@ -32,13 +32,6 @@ jobs:
         options: >-
           --security-opt no-new-privileges:true
 
-      mosquitto:
-        image: eclipse-mosquitto:2@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797  # 2.1.2-alpine
-        ports:
-          - 1884:1883
-        options: >-
-          --security-opt no-new-privileges:true
-
       hivemq:
         image: hivemq/hivemq-ce@sha256:7ae39e84654a41ced6e946dd84f131d508bc2b862ec96265b7f23d241db214da  # latest
         ports:
@@ -65,19 +58,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Copy mosquitto config
-        env:
-          MOSQUITTO_ID: ${{ job.services.mosquitto.id }}
-        run: |
-          echo "Mosquitto container: $MOSQUITTO_ID"
-          docker cp docker/mosquitto.conf "$MOSQUITTO_ID:/mosquitto/config/mosquitto.conf"
-          docker cp docker/mosquitto.acl "$MOSQUITTO_ID:/mosquitto/config/mosquitto.acl"
-          docker exec "$MOSQUITTO_ID" chmod 644 \
-            /mosquitto/config/mosquitto.conf \
-            /mosquitto/config/mosquitto.acl
-          # SIGHUP reloads the config and the ACL file without dropping the
-          # listener, so the service container keeps its published port.
-          docker kill -s HUP "$MOSQUITTO_ID"
+      # Mosquitto needs Dynamic Security to deny UNSUBSCRIBE, and its ACLs can only
+      # be provisioned once the broker runs, so it starts from compose instead.
+      - name: Start Mosquitto test service
+        run: docker compose up --detach --wait mosquitto
 
       - name: Wait for brokers
         run: |
@@ -123,10 +107,26 @@ jobs:
       - name: Install and start mosquitto
         run: |
           brew install mosquitto
-          printf 'listener 1884\nallow_anonymous true\nacl_file %s\n' \
-            "$GITHUB_WORKSPACE/docker/mosquitto.acl" > /tmp/mosquitto.conf
-          $(brew --prefix)/sbin/mosquitto -c /tmp/mosquitto.conf -d
+          MQTT_PREFIX="$(brew --prefix)"
+          SECURITY_FILE=/tmp/dynamic-security.json
+          "$MQTT_PREFIX/bin/mosquitto_ctrl" dynsec init "$SECURITY_FILE" admin admin
+          printf 'listener 1884\nallow_anonymous true\nplugin %s\nplugin_opt_config_file %s\n' \
+            "$MQTT_PREFIX/lib/mosquitto_dynamic_security.so" "$SECURITY_FILE" > /tmp/mosquitto.conf
+          "$MQTT_PREFIX/sbin/mosquitto" -c /tmp/mosquitto.conf -d
           sleep 2
+          dynsec() {
+            "$MQTT_PREFIX/bin/mosquitto_ctrl" -h 127.0.0.1 -p 1884 -u admin -P admin dynsec "$@"
+          }
+          dynsec setDefaultACLAccess publishClientSend allow
+          dynsec setDefaultACLAccess subscribe allow
+          dynsec createClient zmqtt-mosquitto -p zmqtt-mosquitto
+          dynsec createRole zmqtt-tests
+          dynsec addClientRole zmqtt-mosquitto zmqtt-tests 10
+          dynsec addRoleACL zmqtt-tests subscribePattern '#' allow 10
+          dynsec addRoleACL zmqtt-tests publishClientSend '#' allow 10
+          dynsec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
+          dynsec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
+          dynsec addRoleACL zmqtt-tests unsubscribePattern 'zmqtt/unsuback/denied/#' deny 20
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -147,20 +147,73 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install and start mosquitto
+      - name: Install Mosquitto
         shell: pwsh
         run: |
           winget install -e --id EclipseFoundation.Mosquitto --accept-source-agreements --accept-package-agreements --silent
-          $acl = "$env:GITHUB_WORKSPACE\docker\mosquitto.acl"
-          Set-Content -Path "$env:TEMP\mosquitto.conf" -Value "listener 1884`r`nallow_anonymous true`r`nacl_file $acl"
-          Start-Process -FilePath "C:\Program Files\mosquitto\mosquitto.exe" -ArgumentList "-c $env:TEMP\mosquitto.conf" -WindowStyle Hidden
-          Start-Sleep -Seconds 3
+          $mosquittoDir = "C:\Program Files\mosquitto"
+          $ctrl = "$mosquittoDir/mosquitto_ctrl.exe"
+          $security = Join-Path $env:TEMP "dynamic-security.json"
+          & $ctrl dynsec init $security admin admin
+          $config = @(
+            "per_listener_settings false"
+            "plugin $mosquittoDir\mosquitto_dynamic_security.dll"
+            "plugin_opt_config_file $security"
+            "listener 1884"
+            "allow_anonymous true"
+          )
+          Set-Content -Path "$env:TEMP/mosquitto.conf" -Value $config -Encoding utf8NoBOM
+          "MOSQUITTO_DIR=$mosquittoDir" >> $env:GITHUB_ENV
+          "MOSQUITTO_CTRL=$ctrl" >> $env:GITHUB_ENV
+          "MOSQUITTO_CONFIG=$env:TEMP/mosquitto.conf" >> $env:GITHUB_ENV
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked --group dev
-      - run: uv run pytest -vv --ignore=tests/test_brokers/test_artemis.py --ignore=tests/test_brokers/test_hivemq.py --ignore=tests/test_brokers/test_nanomq.py --ignore=tests/test_brokers/test_emqx.py
+      # The broker must stay in the same step as pytest: a process started with
+      # Start-Process does not outlive the step on Windows runners.
+      - name: Run Mosquitto and targeted tests
+        shell: pwsh
+        run: |
+          $broker = Start-Process -FilePath "$env:MOSQUITTO_DIR/mosquitto.exe" `
+            -ArgumentList "-c $env:MOSQUITTO_CONFIG" `
+            -WorkingDirectory $env:MOSQUITTO_DIR `
+            -WindowStyle Hidden -PassThru
+          $testExitCode = 1
+          try {
+            Start-Sleep -Seconds 3
+            if ($broker.HasExited) {
+              throw "Mosquitto exited with code $($broker.ExitCode)"
+            }
+            function DynSec { & $env:MOSQUITTO_CTRL -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
+            DynSec setDefaultACLAccess publishClientSend allow
+            DynSec setDefaultACLAccess subscribe allow
+            DynSec createGroup zmqtt-anonymous-clients
+            DynSec createRole zmqtt-anonymous-role
+            DynSec addGroupRole zmqtt-anonymous-clients zmqtt-anonymous-role 10
+            DynSec addRoleACL zmqtt-anonymous-role subscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-anonymous-role publishClientSend '#' allow 10
+            DynSec setAnonymousGroup zmqtt-anonymous-clients
+            DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
+            DynSec createRole zmqtt-tests
+            DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
+            DynSec addRoleACL zmqtt-tests subscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-tests publishClientSend '#' allow 10
+            DynSec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
+            DynSec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
+            DynSec addRoleACL zmqtt-tests unsubscribePattern zmqtt/unsuback/denied/# deny 20
+            & uv run pytest -vv --ignore=tests/test_brokers/test_artemis.py --ignore=tests/test_brokers/test_hivemq.py --ignore=tests/test_brokers/test_nanomq.py --ignore=tests/test_brokers/test_emqx.py
+            $testExitCode = $LASTEXITCODE
+          } finally {
+            $broker.Refresh()
+            if (-not $broker.HasExited) {
+              Stop-Process -Id $broker.Id -Force
+            }
+          }
+          if ($testExitCode -ne 0) {
+            exit $testExitCode
+          }
 
   coverage:
     name: Publish coverage
