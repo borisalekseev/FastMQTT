@@ -12,13 +12,13 @@ from typing import Literal
 
 import pytest
 
-from zmqtt._internal.packets.codec import encode
+from zmqtt._internal.packets.codec import AnyPacket, encode
 from zmqtt._internal.packets.connect import ConnAck, Connect
 from zmqtt._internal.packets.disconnect import Disconnect
 from zmqtt._internal.packets.properties import PublishProperties
 from zmqtt._internal.packets.publish import PubAck, Publish, PubRec, PubRel
 from zmqtt._internal.packets.reader import PacketBuffer
-from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest
+from zmqtt._internal.packets.subscribe import SubAck, Subscribe, SubscriptionRequest, UnsubAck
 from zmqtt._internal.protocol import (
     _PUBLISH_REASON_NAMES,
     MQTTProtocol,
@@ -537,6 +537,31 @@ async def test_suback_failure_rolls_back_subscription_index() -> None:
 
     assert not protocol._state.subscriptions.contains("denied/topic")
     assert protocol._state.subscriptions.by_identifier(7) == []
+
+
+async def _answer_after(transport: FakeTransport, *, sent: int, packet: AnyPacket) -> None:
+    while len(transport.sent) < sent:  # noqa: ASYNC110
+        await asyncio.sleep(0)
+    transport.feed(encode(packet, version="5.0"))
+
+
+async def test_failed_observer_resubscribe_keeps_unsuback(caplog: pytest.LogCaptureFixture) -> None:
+    protocol, transport = make_protocol(version="5.0")
+    protocol._state.subscriptions.add_many({f: SubscriptionEntry(queue=asyncio.Queue()) for f in ("reply", "events/#")})
+    protocol._state.subscriptions.add_response_observer("reply")
+    read = await _run_read_loop(protocol)
+
+    with caplog.at_level(logging.WARNING, logger="zmqtt.protocol"):
+        unsubscribing = asyncio.create_task(protocol.unsubscribe(["reply", "events/#"]))
+        await _answer_after(transport, sent=1, packet=UnsubAck(packet_id=1, reason_codes=(0x00,)))
+        await _answer_after(transport, sent=2, packet=SubAck(packet_id=1, return_codes=(0x87,)))
+        acknowledged = await unsubscribing
+    await _stop_task(read)
+
+    assert acknowledged is not None
+    assert acknowledged[0] == ("events/#",)
+    assert acknowledged[1].reason_codes == (0x00,)
+    assert any(record.exc_info and "reply" in record.getMessage() for record in caplog.records)
 
 
 async def test_inbound_qos2_manual_ack_duplicate_ignored() -> None:

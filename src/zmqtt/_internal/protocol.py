@@ -433,7 +433,10 @@ class MQTTProtocol:
             acknowledged = (tuple(broker_filters), unsuback)
         if observed_filters:
             requests = [SubscriptionRequest(topic_filter=f, qos=QoS.AT_MOST_ONCE) for f in observed_filters]
-            await self._send_subscribe(requests, subscription_identifier=None)
+            try:
+                await self._send_subscribe(requests, subscription_identifier=None)
+            except Exception:  # noqa: BLE001 - must not discard the UNSUBACK already received
+                log.warning("Restoring response observers %s failed", observed_filters, exc_info=True)
         return acknowledged
 
     async def add_response_observer(self, topic: str) -> None:
