@@ -103,6 +103,7 @@ def make_protocol(
     ping_timeout: float = 5.0,
     stripped_prefixes: tuple[str, ...] = _DEFAULT_STRIPPED_PREFIXES,
     version: Literal["3.1.1", "5.0"] = "3.1.1",
+    incoming_topic_alias_maximum: int = 0,
 ) -> tuple[MQTTProtocol, FakeTransport]:
     transport = FakeTransport()
     state = SessionState()
@@ -113,6 +114,7 @@ def make_protocol(
         ping_timeout=ping_timeout,
         stripped_prefixes=stripped_prefixes,
         version=version,
+        incoming_topic_alias_maximum=incoming_topic_alias_maximum,
     )
     return protocol, transport
 

@@ -24,6 +24,7 @@ from zmqtt._internal.packets.subscribe import SubscriptionRequest
 from zmqtt._internal.protocol import MQTTProtocol
 from zmqtt._internal.request_response import _RequestDispatcher
 from zmqtt._internal.state import SessionState
+from zmqtt._internal.topic_aliases import MAX_ALIAS as _MAX_ALIAS
 from zmqtt._internal.topic_matching import _DEFAULT_STRIPPED_PREFIXES
 from zmqtt._internal.transport.base import Transport
 from zmqtt._internal.transport.tcp import open_tcp
@@ -407,6 +408,7 @@ class MQTTClient:
         max_pending_requests: int = 1000,
         session_replay_buffer_size: int = 1000,
         session_replay_timeout: float = 30.0,
+        topic_alias_maximum: int = 0,
     ) -> None:
         """Create an MQTT client.
 
@@ -461,9 +463,18 @@ class MQTTClient:
             session_replay_timeout: Seconds a persistent-session message may
                 remain in the replay buffer. Remaining messages are dropped
                 without acknowledgement after the timeout. Defaults to ``30.0``.
+            topic_alias_maximum: MQTT 5.0 Topic Alias Maximum to advertise in
+                CONNECT — how many aliases the *server* may use when publishing
+                towards this client (incoming aliases are disabled when ``0``,
+                the default). Outgoing aliases are governed separately by the
+                server's own Topic Alias Maximum from CONNACK. Ignored for
+                MQTT 3.1.1. Must be in ``0..65535``.
         """
         if not mqtt_connect_timeout > 0:
             msg = "mqtt_connect_timeout must be positive"
+            raise ValueError(msg)
+        if not 0 <= topic_alias_maximum <= _MAX_ALIAS:
+            msg = f"topic_alias_maximum must be in 0..{_MAX_ALIAS}"
             raise ValueError(msg)
         if session_replay_buffer_size < 0:
             msg = "session_replay_buffer_size must be non-negative"
@@ -493,6 +504,7 @@ class MQTTClient:
         self._request_dispatcher = _RequestDispatcher(max_pending_requests)
         self._session_replay_buffer_size = session_replay_buffer_size
         self._session_replay_timeout = session_replay_timeout
+        self._topic_alias_maximum = topic_alias_maximum
         self._connection_info: ConnectionInfo | None = None
         self._connection_id = 0
         self._protocol: MQTTProtocol | None = None
@@ -601,7 +613,10 @@ class MQTTClient:
             RuntimeError: If *properties* is supplied on an MQTT 3.1.1 connection.
             MQTTPublishError: If the broker rejects a QoS 1/2 publish. Not raised for QoS 0 or MQTT 3.1.1.
         """
-        validate_publish(topic)
+        validate_publish(
+            topic,
+            topic_alias=properties.topic_alias if properties is not None else None,
+        )
         if self._protocol is None:
             msg = "Not connected"
             raise MQTTDisconnectedError(msg)
@@ -828,11 +843,13 @@ class MQTTClient:
             request_router=self._request_dispatcher,
             session_replay_buffer_size=self._session_replay_buffer_size,
             session_replay_timeout=self._session_replay_timeout,
+            incoming_topic_alias_maximum=self._topic_alias_maximum,
         )
         connect_props = None
         if self._version == "5.0":
             connect_props = ConnectProperties(
                 session_expiry_interval=self._session_expiry_interval,
+                topic_alias_maximum=self._topic_alias_maximum or None,
             )
         connect_packet = Connect(
             client_id=self._client_id,
@@ -952,6 +969,7 @@ def create_client(
     max_pending_requests: int = ...,
     session_replay_buffer_size: int = ...,
     session_replay_timeout: float = ...,
+    topic_alias_maximum: int = ...,
 ) -> MQTTClientV311: ...
 
 
@@ -975,6 +993,7 @@ def create_client(
     max_pending_requests: int = ...,
     session_replay_buffer_size: int = ...,
     session_replay_timeout: float = ...,
+    topic_alias_maximum: int = ...,
     version: Literal["3.1.1"],
 ) -> MQTTClientV311: ...
 
@@ -999,6 +1018,7 @@ def create_client(
     max_pending_requests: int = ...,
     session_replay_buffer_size: int = ...,
     session_replay_timeout: float = ...,
+    topic_alias_maximum: int = ...,
     version: Literal["5.0"],
 ) -> MQTTClientV5: ...
 
@@ -1022,6 +1042,7 @@ def create_client(
     max_pending_requests: int = 1000,
     session_replay_buffer_size: int = 1000,
     session_replay_timeout: float = 30.0,
+    topic_alias_maximum: int = 0,
     version: Literal["3.1.1", "5.0"] = "3.1.1",
 ) -> MQTTClientV311 | MQTTClientV5:
     """Create a version-typed MQTT client.
@@ -1048,4 +1069,5 @@ def create_client(
         max_pending_requests=max_pending_requests,
         session_replay_buffer_size=session_replay_buffer_size,
         session_replay_timeout=session_replay_timeout,
+        topic_alias_maximum=topic_alias_maximum,
     )
