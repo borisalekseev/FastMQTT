@@ -111,20 +111,8 @@ jobs:
           printf 'listener 1884\nallow_anonymous true\nplugin %s\nplugin_opt_config_file %s\n' \
             "$MQTT_PREFIX/lib/mosquitto_dynamic_security.so" "$SECURITY_FILE" > /tmp/mosquitto.conf
           "$MQTT_PREFIX/sbin/mosquitto" -c /tmp/mosquitto.conf -d
-          sleep 2
-          dynsec() {
-            "$MQTT_PREFIX/bin/mosquitto_ctrl" -h 127.0.0.1 -p 1884 -u admin -P admin dynsec "$@"
-          }
-          dynsec setDefaultACLAccess publishClientSend allow
-          dynsec setDefaultACLAccess subscribe allow
-          dynsec createClient zmqtt-mosquitto -p zmqtt-mosquitto
-          dynsec createRole zmqtt-tests
-          dynsec addClientRole zmqtt-mosquitto zmqtt-tests 10
-          dynsec addRoleACL zmqtt-tests subscribePattern '#' allow 10
-          dynsec addRoleACL zmqtt-tests publishClientSend '#' allow 10
-          dynsec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
-          dynsec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
-          dynsec addRoleACL zmqtt-tests unsubscribePattern 'zmqtt/unsuback/denied/#' deny 20
+          MOSQUITTO_CTRL="$MQTT_PREFIX/bin/mosquitto_ctrl" MOSQUITTO_PORT=1884 \
+            sh docker/dynsec-bootstrap.sh
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -180,27 +168,16 @@ jobs:
             -WindowStyle Hidden -PassThru
           $testExitCode = 1
           try {
-            Start-Sleep -Seconds 3
-            if ($broker.HasExited) {
-              throw "Mosquitto exited with code $($broker.ExitCode)"
+            $env:MOSQUITTO_CTRL = $env:MOSQUITTO_CTRL -replace '\\', '/'
+            $env:MOSQUITTO_PORT = "1884"
+            & bash docker/dynsec-bootstrap.sh
+            if ($LASTEXITCODE -ne 0) {
+              $broker.Refresh()
+              if ($broker.HasExited) {
+                throw "Mosquitto exited with code $($broker.ExitCode)"
+              }
+              throw "Dynamic Security bootstrap failed"
             }
-            function DynSec { & $env:MOSQUITTO_CTRL -h 127.0.0.1 -p 1884 -u admin -P admin dynsec @args }
-            DynSec setDefaultACLAccess publishClientSend allow
-            DynSec setDefaultACLAccess subscribe allow
-            DynSec createGroup zmqtt-anonymous-clients
-            DynSec createRole zmqtt-anonymous-role
-            DynSec addGroupRole zmqtt-anonymous-clients zmqtt-anonymous-role 10
-            DynSec addRoleACL zmqtt-anonymous-role subscribePattern '#' allow 10
-            DynSec addRoleACL zmqtt-anonymous-role publishClientSend '#' allow 10
-            DynSec setAnonymousGroup zmqtt-anonymous-clients
-            DynSec createClient zmqtt-mosquitto -p zmqtt-mosquitto
-            DynSec createRole zmqtt-tests
-            DynSec addClientRole zmqtt-mosquitto zmqtt-tests 10
-            DynSec addRoleACL zmqtt-tests subscribePattern '#' allow 10
-            DynSec addRoleACL zmqtt-tests publishClientSend '#' allow 10
-            DynSec addRoleACL zmqtt-tests publishClientSend zmqtt/e2e/denied deny 20
-            DynSec addRoleACL zmqtt-tests unsubscribePattern '#' allow 10
-            DynSec addRoleACL zmqtt-tests unsubscribePattern zmqtt/unsuback/denied/# deny 20
             & uv run pytest -vv --ignore=tests/test_brokers/test_artemis.py --ignore=tests/test_brokers/test_hivemq.py --ignore=tests/test_brokers/test_nanomq.py --ignore=tests/test_brokers/test_emqx.py
             $testExitCode = $LASTEXITCODE
           } finally {

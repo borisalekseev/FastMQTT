@@ -14,6 +14,7 @@ services:
     volumes:
       - ./docker/mosquitto-dynsec.conf:/mosquitto/config/mosquitto-dynsec.conf:ro
       - ./docker/start-mosquitto-dynsec.sh:/mosquitto/config/start-mosquitto-dynsec.sh:ro
+      - ./docker/dynsec-bootstrap.sh:/mosquitto/config/dynsec-bootstrap.sh:ro
     tmpfs:
       - /mosquitto/data
     ports:
@@ -22,7 +23,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "mosquitto_ctrl -h 127.0.0.1 -p 1883 -u admin -P admin dynsec getClient zmqtt-mosquitto >/dev/null 2>&1",
+          "mosquitto_ctrl -h 127.0.0.1 -p 1883 -u admin -P admin dynsec getClient zmqtt-mosquitto 2>&1 | grep -q zmqtt-tests",
         ]
       interval: 1s
       timeout: 2s
