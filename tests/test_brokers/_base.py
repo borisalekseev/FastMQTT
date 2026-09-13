@@ -7,6 +7,7 @@ Run with:  pytest -m broker
 import abc
 import asyncio
 import contextlib
+import logging
 import ssl
 import uuid
 from collections.abc import AsyncGenerator
@@ -185,6 +186,52 @@ class BrokerTestBase(abc.ABC):
 
         message = await asyncio.wait_for(concrete.get_message(), timeout=5.0)
         assert message.payload == b"exact-remains"
+
+    async def test_stop_returns_broker_acknowledgement(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(f"{topic}/a", f"{topic}/b")
+        await sub.start()
+
+        result = await sub.stop()
+
+        assert result is not None
+        assert result.topic_filters == (f"{topic}/a", f"{topic}/b")
+        assert result.reason_codes == ((0x00, 0x00) if self.version == "5.0" else ())
+        assert result.failures == {}
+
+    async def test_stop_after_disconnect_returns_none(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(topic)
+        await sub.start()
+        await mqtt_client.disconnect()
+
+        result = await sub.stop()
+
+        assert result is None
+
+    async def test_repeated_stop_returns_none(self, mqtt_client: MQTTClient, topic: str) -> None:
+        sub = mqtt_client.subscribe(topic)
+        await sub.start()
+        await sub.stop()
+
+        result = await sub.stop()
+
+        assert result is None
+
+    async def test_stop_after_connection_loss_logs_failure(self, topic: str, caplog: pytest.LogCaptureFixture) -> None:
+        async with MQTTClient(
+            self.host,
+            self.port,
+            reconnect=ReconnectConfig(enabled=False),
+            version=self.version,
+        ) as client:
+            sub = client.subscribe(topic)
+            await sub.start()
+            await self.force_tcp_disconnect(client)
+
+            with caplog.at_level(logging.WARNING, logger="zmqtt.client"):
+                result = await sub.stop()
+
+        assert result is None
+        assert any(record.exc_info for record in caplog.records if record.name == "zmqtt.client")
 
     async def test_unsubscribe_identifier_preserves_other_subscription(
         self,
@@ -1006,7 +1053,7 @@ class BrokerTestBase(abc.ABC):
             )
             request = await asyncio.wait_for(req_sub.get_message(), timeout=5.0)
             assert request.properties is not None
-            await response_sub.stop()
+            result = await response_sub.stop()
             await responder.publish(
                 response_topic,
                 b"response-after-stop",
@@ -1016,7 +1063,43 @@ class BrokerTestBase(abc.ABC):
             )
             reply = await request_task
 
+        assert result is None
         assert reply.payload == b"response-after-stop"
+
+    async def test_stop_reports_only_filters_sent_to_broker(self, topic: str) -> None:
+        if self.version != "5.0":
+            pytest.skip("request() requires MQTT 5.0")
+        response_topic = f"{topic}/responses"
+        other_filter = f"{topic}/other"
+        async with (
+            MQTTClient(self.host, self.port, version=self.version) as requester,
+            MQTTClient(self.host, self.port, version=self.version) as responder,
+            responder.subscribe(topic) as requests,
+        ):
+            response_sub = requester.subscribe(response_topic, other_filter)
+            await response_sub.start()
+            request_task = asyncio.create_task(
+                requester.request(
+                    topic,
+                    b"request",
+                    properties=PublishProperties(response_topic=response_topic),
+                    timeout=5.0,
+                ),
+            )
+            request = await asyncio.wait_for(requests.get_message(), timeout=5.0)
+            assert request.properties is not None
+
+            result = await response_sub.stop()
+            await responder.publish(
+                response_topic,
+                b"reply",
+                properties=PublishProperties(correlation_data=request.properties.correlation_data),
+            )
+            reply = await request_task
+
+        assert result is not None
+        assert result.topic_filters == (other_filter,)
+        assert reply.payload == b"reply"
 
     async def test_request_backpressure_delays_publish(self, topic: str) -> None:
         if self.version != "5.0":

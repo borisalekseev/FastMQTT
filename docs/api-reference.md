@@ -49,6 +49,10 @@
     options:
       show_source: false
 
+::: zmqtt.UnsubscribeResult
+    options:
+      show_source: false
+
 ## Configuration
 
 ::: zmqtt.client.ReconnectConfig
@@ -82,6 +86,10 @@
       show_source: false
 
 ::: zmqtt.ConnAckProperties
+    options:
+      show_source: false
+
+::: zmqtt.UnsubAckProperties
     options:
       show_source: false
 
