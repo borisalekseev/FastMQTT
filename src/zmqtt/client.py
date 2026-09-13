@@ -18,9 +18,10 @@ from zmqtt._internal.packets.properties import (
     ConnAckProperties,
     ConnectProperties,
     PublishProperties,
+    UnsubAckProperties,
 )
 from zmqtt._internal.packets.publish import Publish
-from zmqtt._internal.packets.subscribe import SubscriptionRequest
+from zmqtt._internal.packets.subscribe import SubscriptionRequest, UnsubAck
 from zmqtt._internal.protocol import MQTTProtocol
 from zmqtt._internal.request_response import _RequestDispatcher
 from zmqtt._internal.state import SessionState
@@ -42,6 +43,7 @@ __all__ = (
     "ReconnectConfig",
     "Subscription",
     "Transport",
+    "UnsubscribeResult",
     "create_client",
 )
 
@@ -49,6 +51,8 @@ TransportFactory = Callable[[str, int, ssl.SSLContext | bool | None], Awaitable[
 
 # MQTT 5.0 §3.8.2.1.2: a subscription identifier is a variable-byte integer.
 _MAX_SUBSCRIPTION_IDENTIFIER = 268_435_455
+
+_UNSUBACK_REJECTION_THRESHOLD: Final = 0x80
 
 log = logging.getLogger(__name__)
 
@@ -111,6 +115,43 @@ class ConnectionInfo:
             effective_keepalive=keepalive,
             effective_session_expiry_interval=expiry,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class UnsubscribeResult:
+    """The broker's UNSUBACK for the filters sent in one UNSUBSCRIBE.
+
+    Attributes:
+        topic_filters: Filters sent to the broker, in request order.
+        reason_codes: One code per filter. Empty on MQTT 3.1.1, whose UNSUBACK
+            carries none.
+        properties: Raw UNSUBACK properties.
+    """
+
+    topic_filters: tuple[str, ...]
+    reason_codes: tuple[int, ...]
+    properties: UnsubAckProperties | None
+
+    @classmethod
+    def from_unsuback(cls, topic_filters: tuple[str, ...], unsuback: UnsubAck) -> Self:
+        return cls(topic_filters=topic_filters, reason_codes=unsuback.reason_codes, properties=unsuback.properties)
+
+    @property
+    def failures(self) -> dict[str, int]:
+        """Rejected filters mapped to their reason codes (>= 0x80)."""
+        return {
+            f: code
+            for f, code in zip(self.topic_filters, self.reason_codes, strict=False)
+            if code >= _UNSUBACK_REJECTION_THRESHOLD
+        }
+
+    @property
+    def reason_string(self) -> str | None:
+        return self.properties.reason_string if self.properties is not None else None
+
+    @property
+    def user_properties(self) -> tuple[tuple[str, str], ...]:
+        return self.properties.user_properties if self.properties is not None else ()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -273,12 +314,22 @@ class Subscription:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
-        """Unsubscribe from all filters and stop message delivery."""
+        """Same as :meth:`stop`, discarding its result; skips UNSUBSCRIBE if the body was cancelled."""
+        await self._stop(cancelled=isinstance(exc[1], asyncio.CancelledError))
+
+    async def _stop(self, *, cancelled: bool) -> UnsubscribeResult | None:
+        if self not in self._client._subscriptions:
+            return None
         self._client._subscriptions.remove(self)
-        being_cancelled = isinstance(exc[1], asyncio.CancelledError)
-        if not being_cancelled and self._registered_filters and self._client._protocol is not None:
-            with contextlib.suppress(Exception):
-                await self._client._protocol.unsubscribe(self._registered_filters)
+        protocol = self._client._protocol
+        if cancelled or not self._registered_filters or protocol is None:
+            return None
+        try:
+            sent = await protocol.unsubscribe(self._registered_filters)
+        except Exception:  # noqa: BLE001 - filters are already released locally, so nothing is left to retry
+            log.warning("Unsubscribe of %s failed; stopped locally", self._registered_filters, exc_info=True)
+            return None
+        return UnsubscribeResult.from_unsuback(*sent) if sent is not None else None
 
     async def _do_subscribe(self, protocol: MQTTProtocol) -> None:
         reqs = [
@@ -321,18 +372,21 @@ class Subscription:
         """
         await self.__aenter__()
 
-    async def stop(self) -> None:
+    async def stop(self) -> UnsubscribeResult | None:
         """Unsubscribe from all filters and stop message delivery.
 
         Equivalent to exiting the async context manager. Sends UNSUBSCRIBE to
-        the broker. Safe to call even if the connection has already been lost —
-        the UNSUBSCRIBE is silently skipped in that case.
+        the broker. Never raises: failures and rejected filters are logged as
+        warnings.
 
         Example::
 
             await sub.stop()
+
+        Returns:
+            The broker's UNSUBACK, or ``None`` if none was received.
         """
-        await self.__aexit__(None, None, None)
+        return await self._stop(cancelled=False)
 
     async def get_message(self) -> Message:
         """Wait for and return the next message from the subscription queue.

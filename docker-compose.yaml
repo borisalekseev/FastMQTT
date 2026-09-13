@@ -9,12 +9,25 @@ services:
       - no-new-privileges:true
 
   mosquitto:
-    image: eclipse-mosquitto:2
+    image: eclipse-mosquitto:2@sha256:6f8d8a947c506f8a2290ec65cd4bd2bc7cb4d43fb5f6271f861cb013e2ef9797 # 2.1.2-alpine
+    command: /bin/sh /mosquitto/config/start-mosquitto-dynsec.sh
     volumes:
-      - ./docker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-      - ./docker/mosquitto.acl:/mosquitto/config/mosquitto.acl:ro
+      - ./docker/mosquitto-dynsec.conf:/mosquitto/config/mosquitto-dynsec.conf:ro
+      - ./docker/start-mosquitto-dynsec.sh:/mosquitto/config/start-mosquitto-dynsec.sh:ro
+      - ./docker/dynsec-bootstrap.sh:/mosquitto/config/dynsec-bootstrap.sh:ro
+    tmpfs:
+      - /mosquitto/data
     ports:
       - "1884:1883"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mosquitto_ctrl -h 127.0.0.1 -p 1883 -u admin -P admin dynsec getClient zmqtt-mosquitto 2>&1 | grep -q zmqtt-tests",
+        ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
     security_opt:
       - no-new-privileges:true
 

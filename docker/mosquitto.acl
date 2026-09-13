@@ -1,6 +1,0 @@
-# ACL for the test broker. Setting acl_file in mosquitto.conf switches mosquitto to
-# deny-by-default, so the file allows every topic and then denies only the one topic
-# the publish-rejection test needs.
-topic readwrite #
-topic readwrite $SYS/#
-topic deny zmqtt/e2e/denied

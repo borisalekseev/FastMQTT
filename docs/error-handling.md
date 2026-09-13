@@ -91,6 +91,8 @@ except MQTTSubscribeError as e:
 
 The same exception is raised by `await sub.start()` when using the manual subscription lifecycle.
 
+A rejected UNSUBSCRIBE is not an exception — see [Manual subscription lifecycle](subscribing.md#manual-subscription-lifecycle).
+
 ### `MQTTPublishError`
 
 Raised on a `version="5.0"` connection when the broker rejects a QoS 1 or QoS 2

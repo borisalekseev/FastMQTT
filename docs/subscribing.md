@@ -24,7 +24,16 @@ async for msg in sub:
 await sub.stop()
 ```
 
-`stop()` sends UNSUBSCRIBE and releases internal resources. It is safe to call even if the connection has already been lost.
+`stop()` sends UNSUBSCRIBE, stops message delivery and returns the broker's UNSUBACK as an `UnsubscribeResult`, or `None` if none was received — for example after the connection was lost. It never raises: failures and rejections are logged as warnings. Exiting `async with` does the same and discards the result.
+
+On MQTT 5.0 the broker may reject some filters (reason code `0x80` or above); they are listed in `failures`. The subscription stops anyway, but the broker may keep sending messages on a rejected filter — on a persistent session, across reconnects too.
+
+```python
+result = await sub.stop()
+if result is not None:
+    for topic_filter, reason_code in result.failures.items():
+        print(f"{topic_filter!r} rejected: 0x{reason_code:02X}")
+```
 
 ### Buffering and backpressure
 
