@@ -58,8 +58,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # Mosquitto needs Dynamic Security to deny UNSUBSCRIBE, and its ACLs can only
-      # be provisioned once the broker runs, so it starts from compose instead.
       - name: Start Mosquitto test service
         run: docker compose up --detach --wait mosquitto
 
